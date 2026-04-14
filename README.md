@@ -1,36 +1,64 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Expense Tracker (Supabase + Next.js)
 
-## Getting Started
+Multi-user expense tracking with families, bank accounts, and shared members. Uses Supabase Auth/DB/RLS and Next.js 16 + Tailwind.
 
-First, run the development server:
+## Stack
+- Next.js App Router, TypeScript, RSC-first
+- Tailwind CSS v4
+- Supabase Auth, Postgres, RLS
+- Supabase Edge Functions (`create-transaction`, `recurring-runner`)
+- Recharts for charts
 
+## Setup
+1. Install deps
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
 ```
+2. Environment (`.env.local`)
+```
+NEXT_PUBLIC_SUPABASE_URL=...
+NEXT_PUBLIC_SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=...
+SUPABASE_URL=...            # optional fallback
+SUPABASE_ANON_KEY=...       # optional fallback
+```
+3. Database migrations (run in order)
+```
+01_schema.sql
+02_rls.sql
+03_accounts_created_by.sql
+04_fix_account_policy.sql
+05_account_members_default.sql
+06_families_schema.sql
+07_families_rls.sql
+08_migrate_old_to_families.sql
+```
+4. Edge functions
+```bash
+supabase functions deploy create-transaction
+supabase functions deploy recurring-runner
+```
+Schedule `recurring-runner` via Supabase cron to run daily.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Notable features
+- Family model with real/fictitious members, bank accounts, categories, recurring transactions
+- Step-based transaction wizard (IN/OUT/TRANSFER → member → account → amount → category)
+- Dashboard with totals, per-member/category charts, pagination, EUR formatting
+- Persistent auth (Supabase JS with localStorage, auto refresh)
+- RLS strictly scoped by family membership
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Performance
+- Server components for data fetching
+- Pagination on transactions (20/page)
+- Indexes on family_id/account_id/date/etc
+- Loading skeletons for dashboard
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Currency
+- Stored as numeric; formatted as EUR using `Intl.NumberFormat('pt-PT', 'EUR')`
 
-## Learn More
+## CRUD status
+- Families, members, bank accounts, categories, transactions created via UI; goals/loans tables exist (UI minimal) and can be extended.
 
-To learn more about Next.js, take a look at the following resources:
+## Background jobs
+- `recurring-runner` materializes due recurring transactions and advances next date.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
