@@ -1,15 +1,6 @@
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 
-type CookieOptions = {
-  path?: string;
-  domain?: string;
-  maxAge?: number;
-  expires?: string;
-  sameSite?: "lax" | "strict" | "none";
-  secure?: boolean;
-};
-
 export async function supabaseServer() {
   const supabaseUrl =
     process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -24,17 +15,18 @@ export async function supabaseServer() {
   const cookieStore = await cookies();
   return createServerClient(supabaseUrl, supabaseAnonKey, {
     cookies: {
-      get(name: string) {
-        return cookieStore.get(name)?.value;
+      getAll() {
+        return cookieStore.getAll();
       },
-      // In server components we cannot mutate cookies; auth writes happen client-side.
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      set(_name: string, _value: string, _options: CookieOptions) {
-        return;
-      },
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      remove(_name: string, _options: CookieOptions) {
-        return;
+      setAll(cookiesToSet) {
+        // In server components cookie mutations are not always allowed; ignore safely.
+        try {
+          cookiesToSet.forEach(({ name, value, options }) => {
+            cookieStore.set(name, value, options);
+          });
+        } catch {
+          // no-op
+        }
       },
     },
   });

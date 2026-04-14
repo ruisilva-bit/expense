@@ -1,17 +1,24 @@
 "use client";
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
+import type { AuthChangeEvent, Session } from "@supabase/supabase-js";
 import { supabaseBrowser } from "@/lib/supabase-browser";
 
 type User = { id: string; email?: string | null };
 type Family = { id: string; name: string; role?: string | null };
-type BankAccount = { id: string; name: string; balance: number };
-type FamilyMembershipRow = { family_id: string; role?: string | null };
+type BankAccount = {
+  id: string;
+  name: string;
+  balance: number;
+  visible_user_ids?: string[];
+  owner_user_ids?: string[];
+};
 
 type AppState = {
   user: User | null;
   families: Family[];
   accounts: BankAccount[];
+  familiesError: string | null;
   selectedFamily: Family | null;
   selectedAccount: BankAccount | null;
   isAuthLoading: boolean;
@@ -27,95 +34,119 @@ const Context = createContext<AppState | undefined>(undefined);
 
 const SELECTED_FAMILY_KEY = "expense:selected-family";
 const SELECTED_ACCOUNT_KEY = "expense:selected-account";
+const MAIN_ACCOUNT_BY_FAMILY_KEY = "expense:main-account-by-family";
 
-const fetchFamilies = async (userId: string) => {
-  const supabase = supabaseBrowser();
-  const membersRes = await supabase
-    .from("family_members")
-    .select("family_id, role")
-    .eq("user_id", userId);
+const readMainAccountMap = (): Record<string, string> => {
+  if (typeof window === "undefined") return {};
 
-  if (!membersRes.error) {
-    const membershipRows = (membersRes.data as FamilyMembershipRow[] | null) ?? [];
-    if (!membershipRows.length) return [];
+  const raw = window.localStorage.getItem(MAIN_ACCOUNT_BY_FAMILY_KEY);
+  if (!raw) return {};
 
-    const familyIds = membershipRows.map((m) => m.family_id);
-    const familiesRes = await supabase.from("families").select("id,name").in("id", familyIds);
-    if (familiesRes.error) throw familiesRes.error;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
 
-    const byId = new Map((familiesRes.data ?? []).map((family) => [family.id, family.name]));
-
-    return membershipRows.map((membership) => ({
-      id: membership.family_id,
-      name: byId.get(membership.family_id) ?? "Family",
-      role: membership.role ?? null,
-    }));
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string" && !!entry[1]
+      )
+    );
+  } catch {
+    return {};
   }
+};
 
-  const fallback = await supabase.from("families").select("id,name").order("created_at", { ascending: false });
-  if (fallback.error) throw fallback.error;
+const getAuthHeaders = async (): Promise<Record<string, string>> => {
+  const supabase = supabaseBrowser();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  return session?.access_token ? { authorization: `Bearer ${session.access_token}` } : {};
+};
 
-  return (fallback.data ?? []).map((family) => ({
-    id: family.id,
-    name: family.name,
-    role: null,
-  }));
+const fetchJson = async <T,>(input: string, init?: RequestInit): Promise<T> => {
+  const response = await fetch(input, {
+    ...init,
+    cache: "no-store",
+    credentials: "same-origin",
+  });
+  const payload = (await response.json().catch(() => ({}))) as T & { error?: string };
+  if (!response.ok) {
+    throw new Error(payload.error ?? "Request failed.");
+  }
+  return payload;
+};
+
+const fetchFamilies = async () => {
+  const headers = await getAuthHeaders();
+  const payload = await fetchJson<{ families?: Family[]; error?: string }>("/api/families", {
+    method: "GET",
+    headers,
+  });
+  return payload.families ?? [];
 };
 
 const fetchAccounts = async (familyId: string) => {
-  const supabase = supabaseBrowser();
-  const { data, error } = await supabase
-    .from("bank_accounts")
-    .select("id,name,balance")
-    .eq("family_id", familyId);
-  if (error) throw error;
-  return data ?? [];
+  const headers = await getAuthHeaders();
+  const payload = await fetchJson<{ accounts?: BankAccount[]; error?: string }>(
+    `/api/bank-accounts?familyId=${encodeURIComponent(familyId)}`,
+    {
+      method: "GET",
+      headers,
+    }
+  );
+  return payload.accounts ?? [];
 };
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const supabase = useMemo(() => supabaseBrowser(), []);
   const [user, setUser] = useState<User | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
-  const [selectedFamilyId, setSelectedFamilyId] = useState<string | null>(null);
+  const [selectedFamilyId, setSelectedFamilyId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return window.localStorage.getItem(SELECTED_FAMILY_KEY);
+  });
+  const [legacySelectedAccountId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return window.localStorage.getItem(SELECTED_ACCOUNT_KEY);
+  });
+  const [mainAccountByFamily, setMainAccountByFamily] = useState<Record<string, string>>(() => readMainAccountMap());
 
-  const { data: families = [], isLoading: isFamiliesLoading, mutate: mutateFamilies } = useSWR<Family[]>(
+  const { data: families = [], isLoading: isFamiliesLoading, error: familiesError, mutate: mutateFamilies } = useSWR<Family[]>(
     user?.id ? `families:${user.id}` : null,
-    (key: string) => fetchFamilies(key.split(":")[1] ?? ""),
+    () => fetchFamilies(),
     {
       revalidateOnFocus: false,
+      shouldRetryOnError: false,
     }
   );
 
-  const activeFamilyId = selectedFamilyId ?? families[0]?.id ?? null;
+  const selectedFamily = useMemo<Family | null>(() => {
+    if (!families.length) return null;
+    if (!selectedFamilyId) return families[0];
+    return families.find((family) => family.id === selectedFamilyId) ?? families[0];
+  }, [families, selectedFamilyId]);
+
+  const activeFamilyId = selectedFamily?.id ?? null;
 
   const { data: accounts = [], isLoading: isAccountsLoading, mutate: mutateAccounts } = useSWR<BankAccount[]>(
     activeFamilyId ? `accounts:${activeFamilyId}` : null,
     (key: string) => fetchAccounts(key.split(":")[1] ?? ""),
     {
       revalidateOnFocus: false,
+      shouldRetryOnError: false,
     }
   );
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
 
-  const selectedFamily = useMemo<Family | null>(() => {
-    if (!families.length) return null;
-    return families.find((family) => family.id === selectedFamilyId) ?? families[0];
-  }, [families, selectedFamilyId]);
+  const selectedAccountId = activeFamilyId
+    ? mainAccountByFamily[activeFamilyId] ?? legacySelectedAccountId ?? null
+    : null;
 
   const selectedAccount = useMemo<BankAccount | null>(() => {
     if (!accounts.length) return null;
+    if (!selectedAccountId) return accounts[0];
     return accounts.find((account) => account.id === selectedAccountId) ?? accounts[0];
   }, [accounts, selectedAccountId]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const storedFamilyId = window.localStorage.getItem(SELECTED_FAMILY_KEY);
-    const storedAccountId = window.localStorage.getItem(SELECTED_ACCOUNT_KEY);
-
-    if (storedFamilyId) setSelectedFamilyId(storedFamilyId);
-    if (storedAccountId) setSelectedAccountId(storedAccountId);
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -135,6 +166,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             }
           : null
       );
+      if (!session?.user) {
+        setSelectedFamilyId(null);
+        setMainAccountByFamily({});
+      }
       setIsAuthLoading(false);
     };
 
@@ -142,7 +177,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange((_event: AuthChangeEvent, session: Session | null) => {
       setUser(
         session?.user
           ? {
@@ -151,6 +186,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             }
           : null
       );
+      if (!session?.user) {
+        setSelectedFamilyId(null);
+        setMainAccountByFamily({});
+      }
       setIsAuthLoading(false);
       void mutateFamilies();
     });
@@ -175,23 +214,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (typeof window === "undefined") return;
 
-    if (selectedAccount?.id) {
-      window.localStorage.setItem(SELECTED_ACCOUNT_KEY, selectedAccount.id);
+    window.localStorage.setItem(MAIN_ACCOUNT_BY_FAMILY_KEY, JSON.stringify(mainAccountByFamily));
+  }, [mainAccountByFamily]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!selectedAccount?.id) {
+      window.localStorage.removeItem(SELECTED_ACCOUNT_KEY);
       return;
     }
-
-    window.localStorage.removeItem(SELECTED_ACCOUNT_KEY);
-  }, [selectedAccount]);
-
-  useEffect(() => {
-    if (!selectedFamilyId || families.some((family) => family.id === selectedFamilyId)) return;
-    setSelectedFamilyId(null);
-  }, [families, selectedFamilyId]);
-
-  useEffect(() => {
-    if (!selectedAccountId || accounts.some((account) => account.id === selectedAccountId)) return;
-    setSelectedAccountId(null);
-  }, [accounts, selectedAccountId]);
+    // Keep legacy key synced to preserve compatibility with existing sessions.
+    window.localStorage.setItem(SELECTED_ACCOUNT_KEY, selectedAccount.id);
+  }, [selectedAccount?.id]);
 
   const refresh = () => {
     void mutateFamilies();
@@ -204,6 +238,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         user,
         families,
         accounts,
+        familiesError: familiesError instanceof Error ? familiesError.message : null,
         selectedFamily,
         selectedAccount,
         isAuthLoading,
@@ -211,9 +246,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         isAccountsLoading,
         setSelectedFamily: (family) => {
           setSelectedFamilyId(family?.id ?? null);
-          setSelectedAccountId(null);
         },
-        setSelectedAccount: (a) => setSelectedAccountId(a?.id ?? null),
+        setSelectedAccount: (account) => {
+          if (!activeFamilyId) return;
+          setMainAccountByFamily((current) => {
+            const next = { ...current };
+            if (!account?.id) {
+              delete next[activeFamilyId];
+            } else {
+              next[activeFamilyId] = account.id;
+            }
+            return next;
+          });
+        },
         refresh,
         refreshFamilies: () => {
           void mutateFamilies();

@@ -5,9 +5,9 @@ import { useRouter } from "next/navigation";
 
 type Option = { id: string; name: string };
 
-type Props = { accounts: Option[] };
+type Props = { accounts: Option[]; onSaved?: () => void };
 
-export function GoalForm({ accounts }: Props) {
+export function GoalForm({ accounts, onSaved }: Props) {
   const router = useRouter();
   const [form, setForm] = useState({ name: "", target: "", account_id: "", deadline: "" });
   const [error, setError] = useState<string | null>(null);
@@ -16,18 +16,29 @@ export function GoalForm({ accounts }: Props) {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    const { error } = await supabaseBrowser().from("goals").insert({
+    const supabase = supabaseBrowser();
+    let result = await supabase.from("goals").insert({
       name: form.name,
       target_amount: Number(form.target),
       current_amount: 0,
-      account_id: form.account_id || null,
+      bank_account_id: form.account_id || null,
       deadline: form.deadline || null,
     });
+    if (result.error) {
+      result = await supabase.from("goals").insert({
+        name: form.name,
+        target_amount: Number(form.target),
+        current_amount: 0,
+        account_id: form.account_id || null,
+        deadline: form.deadline || null,
+      });
+    }
     setLoading(false);
-    if (error) setError(error.message);
+    if (result.error) setError(result.error.message);
     else {
       setError(null);
       setForm({ name: "", target: "", account_id: "", deadline: "" });
+      onSaved?.();
       router.refresh();
     }
   };

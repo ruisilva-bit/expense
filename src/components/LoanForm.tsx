@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 
 type Option = { id: string; name: string };
 
-export function LoanForm({ accounts }: { accounts: Option[] }) {
+export function LoanForm({ accounts, familyId, onSaved }: { accounts: Option[]; familyId?: string; onSaved?: () => void }) {
   const router = useRouter();
   const [form, setForm] = useState({ name: "", total: "", monthly: "", account_id: accounts[0]?.id ?? "" });
   const [error, setError] = useState<string | null>(null);
@@ -14,17 +14,29 @@ export function LoanForm({ accounts }: { accounts: Option[] }) {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    const { error } = await supabaseBrowser().from("loans").insert({
-      account_id: form.account_id,
+    const supabase = supabaseBrowser();
+    const total = Number(form.total);
+    let result = await supabase.from("loans").insert({
+      family_id: familyId,
       name: form.name,
-      total_amount: Number(form.total),
+      total_amount: total,
+      remaining_amount: total,
       monthly_payment: Number(form.monthly),
     });
+    if (result.error) {
+      result = await supabase.from("loans").insert({
+        account_id: form.account_id,
+        name: form.name,
+        total_amount: total,
+        monthly_payment: Number(form.monthly),
+      });
+    }
     setLoading(false);
-    if (error) setError(error.message);
+    if (result.error) setError(result.error.message);
     else {
       setError(null);
       setForm({ ...form, name: "", total: "", monthly: "" });
+      onSaved?.();
       router.refresh();
     }
   };

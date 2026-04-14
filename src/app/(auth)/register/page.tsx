@@ -3,6 +3,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
 import { useRouter } from "next/navigation";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 export default function RegisterPage() {
   const [email, setEmail] = useState("");
@@ -14,14 +15,23 @@ export default function RegisterPage() {
     e.preventDefault();
     const { error } = await supabaseBrowser().auth.signUp({ email, password });
     if (error) setError(error.message);
-    else router.push("/dashboard");
+    else {
+      router.replace("/families");
+      router.refresh();
+      window.setTimeout(() => {
+        window.location.assign("/families");
+      }, 150);
+    }
   };
 
   return (
     <main className="min-h-screen bg-sand-50 flex items-center justify-center px-4">
+      <div className="fixed right-4 top-4 z-10">
+        <ThemeToggle compact />
+      </div>
       <div className="w-full max-w-md card p-6 space-y-6">
         <div>
-          <p className="text-sm text-slate-500">Expense Tracker</p>
+          <p className="text-sm text-slate-500">HomeFund</p>
           <h1 className="text-2xl font-semibold">Create account</h1>
         </div>
         <form onSubmit={submit} className="space-y-4">

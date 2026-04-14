@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 :root {
   --background: #f8fafb;
@@ -7,6 +8,15 @@
   --sand-100: #f1f5f9;
   --ink-900: #0f172a;
   --accent: #16a34a;
+}
+
+html.dark {
+  --background: #020617;
+  --foreground: #e2e8f0;
+  --sand-50: #0f172a;
+  --sand-100: #1e293b;
+  --ink-900: #f8fafc;
+  --accent: #22c55e;
 }
 
 @theme inline {
@@ -23,6 +33,9 @@
 body {
   background: var(--background);
   color: var(--foreground);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 a {
@@ -30,11 +43,15 @@ a {
 }
 
 .card {
-  @apply rounded-xl border border-slate-200 bg-white shadow-sm;
+  @apply rounded-2xl border border-slate-200 bg-white shadow-sm;
 }
 
 .btn {
-  @apply inline-flex items-center justify-center rounded-lg px-4 py-2 font-medium transition-colors;
+  @apply inline-flex min-h-10 items-center justify-center rounded-xl px-4 py-2 font-medium transition-colors;
+}
+
+.btn:disabled {
+  @apply cursor-not-allowed opacity-50;
 }
 
 .btn-primary {
@@ -46,9 +63,133 @@ a {
 }
 
 .input {
-  @apply w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none;
+  @apply w-full min-h-10 rounded-xl border border-slate-200 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none;
 }
 
 .label {
   @apply text-sm font-medium text-slate-700;
+}
+
+html.dark .card {
+  @apply border-slate-700 bg-slate-900;
+}
+
+html.dark .btn-ghost {
+  @apply border-slate-700 text-slate-100 hover:bg-slate-800;
+}
+
+html.dark .btn-primary {
+  @apply bg-emerald-500 text-slate-950 hover:bg-emerald-400;
+}
+
+html.dark .input {
+  @apply border-slate-700 bg-slate-900 text-slate-100 placeholder:text-slate-500;
+}
+
+html.dark .bg-white {
+  background-color: #0f172a !important;
+}
+
+html.dark .bg-sand-50 {
+  background-color: #020617 !important;
+}
+
+html.dark .bg-slate-50 {
+  background-color: #0f172a !important;
+}
+
+html.dark .bg-slate-100 {
+  background-color: #1e293b !important;
+}
+
+html.dark .bg-slate-200 {
+  background-color: #334155 !important;
+}
+
+html.dark .border-slate-200 {
+  border-color: #334155 !important;
+}
+
+html.dark .text-ink-900 {
+  color: #f1f5f9 !important;
+}
+
+html.dark .text-slate-900 {
+  color: #f1f5f9 !important;
+}
+
+html.dark .text-slate-800 {
+  color: #e2e8f0 !important;
+}
+
+html.dark .text-slate-700 {
+  color: #cbd5e1 !important;
+}
+
+html.dark .text-slate-600 {
+  color: #94a3b8 !important;
+}
+
+html.dark .text-slate-500 {
+  color: #94a3b8 !important;
+}
+
+html.dark .text-slate-400 {
+  color: #64748b !important;
+}
+
+/*
+  Handle Tailwind variant-prefixed classes (e.g. lg:bg-white, hover:text-slate-500)
+  that don't match plain ".bg-white" selectors.
+*/
+html.dark [class*="bg-white"] {
+  background-color: #0f172a !important;
+}
+
+html.dark [class*="bg-sand-50"] {
+  background-color: #020617 !important;
+}
+
+html.dark [class*="bg-slate-50"] {
+  background-color: #0f172a !important;
+}
+
+html.dark [class*="bg-slate-100"] {
+  background-color: #1e293b !important;
+}
+
+html.dark [class*="bg-slate-200"] {
+  background-color: #334155 !important;
+}
+
+html.dark [class*="border-slate-200"] {
+  border-color: #334155 !important;
+}
+
+html.dark [class*="text-ink-900"] {
+  color: #f1f5f9 !important;
+}
+
+html.dark [class*="text-slate-900"] {
+  color: #f1f5f9 !important;
+}
+
+html.dark [class*="text-slate-800"] {
+  color: #e2e8f0 !important;
+}
+
+html.dark [class*="text-slate-700"] {
+  color: #cbd5e1 !important;
+}
+
+html.dark [class*="text-slate-600"] {
+  color: #94a3b8 !important;
+}
+
+html.dark [class*="text-slate-500"] {
+  color: #94a3b8 !important;
+}
+
+html.dark [class*="text-slate-400"] {
+  color: #64748b !important;
 }
