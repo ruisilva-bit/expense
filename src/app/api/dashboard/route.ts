@@ -1,12 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAccessibleAccountIds, getAccountMembershipMap } from "@/lib/api-auth";
-import {
-  effectiveMemberIds,
-  matchesMemberFilter,
-  stripMemberTag,
-} from "@/lib/member-tags";
+import { ensureFamilyMember, getAccessibleAccountIds, getAccountMembershipMap } from "@/lib/api-auth";
+import { extractGoalMove, stripGoalTags } from "@/lib/goal-moves";
+import { filterHumanMembers } from "@/lib/member-kind";
+import { matchesMemberFilter, stripMemberTag } from "@/lib/member-tags";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import { supabaseServer } from "@/lib/supabase-server";
+import {
+  BALANCE_TIMELINE_REUSE_LIMIT,
+  buildBalanceAfterMapFromRows,
+  buildTransferLookupMap,
+  canReusePrefetchedBalanceTimeline,
+  collectTransferIds,
+  inferTransferSideFromDescription,
+  normalizeTransactionType,
+  transferSideFromType,
+  type BalanceTimelineRow,
+  type TransferLookupRow,
+} from "@/lib/transaction-balance";
 
 const LOAN_TAG_REGEX = /\[loan:([0-9a-fA-F-]{36})\]/;
 const LOAN_TAG_STRIP_REGEX = /\s*\[loan:[0-9a-fA-F-]{36}\]\s*/g;
@@ -47,7 +57,7 @@ const stripRecurringTag = (description: string | null | undefined) => {
 };
 
 const stripSystemTags = (description: string | null | undefined) =>
-  stripMemberTag(stripLoanTag(stripTransferTag(stripRecurringTag(description))));
+  stripMemberTag(stripLoanTag(stripTransferTag(stripRecurringTag(stripGoalTags(description)))));
 
 type CategoryRow = {
   id: string;
@@ -57,7 +67,7 @@ type CategoryRow = {
   color?: string | null;
 };
 type AccountRow = { id: string; name: string | null; balance: number | string | null };
-type FamilyMemberRow = { id: string; name: string | null; user_id?: string | null };
+type FamilyMemberRow = { id: string; name: string | null; user_id: string | null };
 type LoanRow = {
   id: string;
   name: string | null;
@@ -75,10 +85,10 @@ type TxnRow = {
   category_id: string | null;
   bank_account_id: string | null;
 };
-type TransferLookupRow = {
-  id: string;
-  source_account_id: string;
-  dest_account_id: string;
+type GoalRow = {
+  current_amount: number | string | null;
+  bank_account_id?: string | null;
+  account_id?: string | null;
 };
 type QueryError = { message: string } | null;
 type CategoryQueryResult = { data: CategoryRow[] | null; error: QueryError };
@@ -166,27 +176,52 @@ const nextDateFromFrequency = (startDate: string, frequency: string | null | und
   return next.toISOString().slice(0, 10);
 };
 
-const inferTransferSideFromDescription = (description: string | null | undefined) => {
-  if (!description) return null;
-  const lower = description.toLowerCase();
-  if (lower.includes("transfer to")) return "source" as const;
-  if (lower.includes("transfer from")) return "dest" as const;
-  return null;
-};
+async function computeBalanceAfterMap(input: {
+  familyId: string;
+  accountCurrentBalance: Map<string, number>;
+  accountIds: string[];
+  sinceDate?: string | null;
+}) {
+  const { familyId, accountCurrentBalance, accountIds, sinceDate } = input;
+  const map = new Map<string, number>();
+  if (!accountIds.length) return map;
 
-const normalizeTransactionType = (value: string | null | undefined) => {
-  const kind = (value ?? "").toLowerCase();
-  if (kind === "income") return "income" as const;
-  if (kind === "expense") return "expense" as const;
-  return "transfer" as const;
-};
+  const admin = supabaseAdmin();
+  let timelineQuery = admin
+    .from("transactions")
+    .select("id,bank_account_id,amount,type,description,date,created_at")
+    .eq("family_id", familyId)
+    .in("bank_account_id", accountIds);
 
-const transferSideFromType = (value: string | null | undefined) => {
-  const kind = (value ?? "").toLowerCase();
-  if (kind === "transfer_in") return "dest" as const;
-  if (kind === "transfer_out") return "source" as const;
-  return null;
-};
+  if (sinceDate) timelineQuery = timelineQuery.gte("date", sinceDate);
+
+  const timelineRes = await timelineQuery
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  if (timelineRes.error) return map;
+
+  const timelineRows = (timelineRes.data ?? []) as BalanceTimelineRow[];
+  const transferIds = collectTransferIds(timelineRows);
+
+  let transferById = new Map<string, { sourceAccountId: string; destAccountId: string }>();
+  if (transferIds.length) {
+    const transferRes = await admin
+      .from("transfers")
+      .select("id,source_account_id,dest_account_id")
+      .in("id", transferIds);
+    if (!transferRes.error) {
+      transferById = buildTransferLookupMap((transferRes.data ?? []) as TransferLookupRow[]);
+    }
+  }
+
+  return buildBalanceAfterMapFromRows({
+    accountCurrentBalance,
+    accountIds,
+    rows: timelineRows,
+    transferById,
+  });
+}
 
 async function getUserFromAuthHeader(request: Request) {
   const admin = supabaseAdmin();
@@ -229,22 +264,13 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: userError ?? "Not signed in" }, { status: 401 });
   }
 
+  const membership = await ensureFamilyMember(familyId, user.id);
+  if (!membership.ok) {
+    return NextResponse.json({ error: membership.error }, { status: membership.status });
+  }
+
   const admin = supabaseAdmin();
-  const membership = await admin
-    .from("family_members")
-    .select("id")
-    .eq("family_id", familyId)
-    .eq("user_id", user.id)
-    .maybeSingle();
-
-  if (membership.error) {
-    return NextResponse.json({ error: membership.error.message }, { status: 400 });
-  }
-  if (!membership.data) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
-
-  const access = await getAccessibleAccountIds(familyId, user.id);
+  const access = await getAccessibleAccountIds(familyId, user.id, { membership: membership.membership });
   if (access.error || !access.accountIds) {
     return NextResponse.json({ error: access.error ?? "Failed to load account access." }, { status: 400 });
   }
@@ -273,8 +299,10 @@ export async function GET(request: NextRequest) {
     if (membersRes.error) return NextResponse.json({ error: membersRes.error.message }, { status: 400 });
     if (categoriesRes.error) return NextResponse.json({ error: categoriesRes.error.message }, { status: 400 });
 
+    const visibleMembers = await filterHumanMembers((membersRes.data ?? []) as FamilyMemberRow[]);
+
     return NextResponse.json({
-      members: ((membersRes.data ?? []) as FamilyMemberRow[]).map((member) => ({
+      members: visibleMembers.map((member) => ({
         id: member.id,
         name: member.name ?? "Member",
       })),
@@ -309,24 +337,22 @@ export async function GET(request: NextRequest) {
     return { includeBankAccountId, loansRes };
   })();
 
-  const [membersRes, accountsRes, loansBundle] = await Promise.all([
-    admin.from("family_members").select("id,name,user_id").eq("family_id", familyId),
-    admin.from("bank_accounts").select("id,name,balance").eq("family_id", familyId).in("id", accessibleAccountIds),
-    loansPromise,
-  ]);
-
-  let categoriesRes = (await admin
-    .from("categories")
-    .select("id,name,type,affects_loan,color")
-    .eq("family_id", familyId)) as CategoryQueryResult;
-  let includeColor = true;
-  if (categoriesRes.error && isMissingColorColumnError(categoriesRes.error.message)) {
-    includeColor = false;
-    categoriesRes = (await admin
+  const categoriesPromise = (async () => {
+    let categoriesRes = (await admin
       .from("categories")
-      .select("id,name,type,affects_loan")
+      .select("id,name,type,affects_loan,color")
       .eq("family_id", familyId)) as CategoryQueryResult;
-  }
+    let includeColor = true;
+    if (categoriesRes.error && isMissingColorColumnError(categoriesRes.error.message)) {
+      includeColor = false;
+      categoriesRes = (await admin
+        .from("categories")
+        .select("id,name,type,affects_loan")
+        .eq("family_id", familyId)) as CategoryQueryResult;
+    }
+
+    return { categoriesRes, includeColor };
+  })();
 
   let txnsQuery = admin
     .from("transactions")
@@ -335,19 +361,27 @@ export async function GET(request: NextRequest) {
     .in("bank_account_id", accessibleAccountIds)
     .order("date", { ascending: false })
     .order("created_at", { ascending: false })
-    .limit(1000);
+    .limit(BALANCE_TIMELINE_REUSE_LIMIT);
 
   if (dateFrom) txnsQuery = txnsQuery.gte("date", dateFrom);
   if (dateTo) txnsQuery = txnsQuery.lte("date", dateTo);
   if (accountIds.length) txnsQuery = txnsQuery.in("bank_account_id", accountIds);
 
-  const txnsRes = await txnsQuery;
-  const usageRes = await admin
-    .from("transactions")
-    .select("category_id")
-    .eq("family_id", familyId)
-    .in("bank_account_id", accessibleAccountIds)
-    .eq("type", "expense");
+  const [membersRes, accountsRes, loansBundle, categoriesBundle, txnsRes, usageRes] = await Promise.all([
+    admin.from("family_members").select("id,name,user_id").eq("family_id", familyId),
+    admin.from("bank_accounts").select("id,name,balance").eq("family_id", familyId).in("id", accessibleAccountIds),
+    loansPromise,
+    categoriesPromise,
+    txnsQuery,
+    admin
+      .from("transactions")
+      .select("category_id")
+      .eq("family_id", familyId)
+      .in("bank_account_id", accessibleAccountIds)
+      .eq("type", "expense"),
+  ]);
+
+  const { categoriesRes, includeColor } = categoriesBundle;
 
   if (membersRes.error) return NextResponse.json({ error: membersRes.error.message }, { status: 400 });
   if (accountsRes.error) return NextResponse.json({ error: accountsRes.error.message }, { status: 400 });
@@ -357,7 +391,7 @@ export async function GET(request: NextRequest) {
   if (usageRes.error) return NextResponse.json({ error: usageRes.error.message }, { status: 400 });
 
   const categories = (categoriesRes.data ?? []) as CategoryRow[];
-  const familyMembers = (membersRes.data ?? []) as FamilyMemberRow[];
+  const familyMembers = await filterHumanMembers((membersRes.data ?? []) as FamilyMemberRow[]);
   const accounts = (accountsRes.data ?? []) as AccountRow[];
   const accountMembership = await getAccountMembershipMap(accounts.map((account) => account.id));
   if (accountMembership.error) {
@@ -413,7 +447,7 @@ export async function GET(request: NextRequest) {
   const monthEnd = toIsoDate(new Date(now.getFullYear(), now.getMonth() + 1, 0));
   const scopedAccountIds = accountIds.length ? accountIds : accessibleAccountIds;
 
-  let recurringPaidQuery = admin
+  const recurringPaidQuery = admin
     .from("transactions")
     .select("amount,assigned_to,description")
     .eq("family_id", familyId)
@@ -423,7 +457,7 @@ export async function GET(request: NextRequest) {
     .lte("date", monthEnd)
     .ilike("description", "%[recurring:%");
 
-  let recurringScheduleQuery = admin
+  const recurringScheduleQuery = admin
     .from("recurring_transactions")
     .select("id,bank_account_id,assigned_to,amount,category_id,frequency,next_execution_date,description")
     .eq("family_id", familyId)
@@ -465,17 +499,7 @@ export async function GET(request: NextRequest) {
     return sum + accumulator;
   }, 0);
 
-  const transferIds = Array.from(
-    new Set(
-      rawTxns
-        .filter((txn) => {
-          const kind = (txn.type ?? "").toLowerCase();
-          return kind === "transfer" || kind === "transfer_in" || kind === "transfer_out";
-        })
-        .map((txn) => extractTransferTag(txn.description)?.id ?? null)
-        .filter((id): id is string => Boolean(id))
-    )
-  );
+  const transferIds = collectTransferIds(rawTxns);
 
   let transferById = new Map<string, { sourceAccountId: string; destAccountId: string }>();
   if (transferIds.length) {
@@ -486,21 +510,16 @@ export async function GET(request: NextRequest) {
     if (transferRes.error) {
       return NextResponse.json({ error: transferRes.error.message }, { status: 400 });
     }
-    transferById = new Map(
-      ((transferRes.data ?? []) as TransferLookupRow[]).map((transfer) => [
-        transfer.id,
-        {
-          sourceAccountId: transfer.source_account_id,
-          destAccountId: transfer.dest_account_id,
-        },
-      ])
-    );
+    transferById = buildTransferLookupMap((transferRes.data ?? []) as TransferLookupRow[]);
   }
 
   const txns = rawTxns.map((txn) => {
     const loanId = extractLoanId(txn.description as string | null | undefined);
     const transferTag = extractTransferTag(txn.description as string | null | undefined);
-    const normalizedType = normalizeTransactionType(txn.type as string | null | undefined);
+    const goalMove = extractGoalMove(txn.description as string | null | undefined);
+    const normalizedType = goalMove && goalMove.moveType !== "spend"
+      ? "transfer"
+      : normalizeTransactionType(txn.type as string | null | undefined);
     let transferSide = transferSideFromType(txn.type as string | null | undefined) ?? transferTag?.side ?? null;
     if (!transferSide && transferTag?.id) {
       const transfer = transferById.get(transferTag.id);
@@ -514,21 +533,90 @@ export async function GET(request: NextRequest) {
     }
     return {
       id: txn.id,
+      bank_account_id: txn.bank_account_id,
       amount: txn.amount,
       type: normalizedType,
-      transfer_side: transferSide,
+      transfer_side: goalMove && goalMove.moveType !== "spend" ? null : transferSide,
+      goal_move_type: goalMove?.moveType ?? null,
       date: txn.date,
       description: stripSystemTags(txn.description as string | null | undefined),
       assigned_to: txn.assigned_to,
       category: {
         id: txn.category_id,
-        name: categoryById.get(txn.category_id as string)?.name ?? "Uncategorized",
+        name:
+          goalMove?.moveType === "allocate"
+            ? "Reserva para goal"
+            : goalMove?.moveType === "release"
+              ? "Libertar do goal"
+              : categoryById.get(txn.category_id as string)?.name
+                ?? (goalMove?.moveType === "spend"
+                  ? "Despesa do goal"
+                  : normalizedType === "transfer"
+                    ? "Transfer"
+                    : "Uncategorized"),
         color: categoryById.get(txn.category_id as string)?.color ?? null,
       },
       bank_account: { name: accountById.get(txn.bank_account_id as string) ?? "Account" },
       loan: loanId ? { id: loanId, name: loanById.get(loanId) ?? "Loan" } : null,
     };
   });
+
+  const goalsRes = await admin.from("goals").select("current_amount,bank_account_id,account_id");
+  if (goalsRes.error) {
+    return NextResponse.json({ error: goalsRes.error.message }, { status: 400 });
+  }
+  const reservedGoalAmount = ((goalsRes.data ?? []) as Array<GoalRow>).reduce((sum, goal) => {
+    const accountId = goal.bank_account_id ?? goal.account_id ?? null;
+    if (!accountId || !scopedAccountIds.includes(accountId)) return sum;
+    return sum + Number(goal.current_amount ?? 0);
+  }, 0);
+
+  const recentTxnsForBalance = txns.slice(0, 10);
+  const oldestRecentTxnDate = recentTxnsForBalance.reduce<string | null>((oldest, txn) => {
+    if (!txn.date) return oldest;
+    if (!oldest) return txn.date;
+    return txn.date < oldest ? txn.date : oldest;
+  }, null);
+  const recentBalanceAccountIds = Array.from(
+    new Set(
+      recentTxnsForBalance
+        .map((txn) => txn.bank_account_id)
+        .filter((accountId): accountId is string => Boolean(accountId))
+    )
+  );
+  const accountCurrentBalance = new Map(accountsWithMeta.map((account) => [account.id, Number(account.balance ?? 0)]));
+  const canReuseTimeline =
+    Boolean(oldestRecentTxnDate) &&
+    recentBalanceAccountIds.length > 0 &&
+    canReusePrefetchedBalanceTimeline({
+      hasUpperDateBound: Boolean(dateTo),
+      fetchedRowCount: (txnsRes.data ?? []).length,
+      fetchLimit: BALANCE_TIMELINE_REUSE_LIMIT,
+    });
+
+  const balanceAfterById = canReuseTimeline
+    ? buildBalanceAfterMapFromRows({
+        accountCurrentBalance,
+        accountIds: recentBalanceAccountIds,
+        rows: ((txnsRes.data ?? []) as BalanceTimelineRow[]).filter(
+          (row) =>
+            recentBalanceAccountIds.includes(row.bank_account_id) &&
+            Boolean(row.date) &&
+            (row.date as string) >= (oldestRecentTxnDate as string)
+        ),
+        transferById,
+      })
+    : await computeBalanceAfterMap({
+        familyId,
+        accountCurrentBalance,
+        accountIds: recentBalanceAccountIds,
+        sinceDate: oldestRecentTxnDate,
+      });
+
+  const txnsWithBalance = txns.map((txn) => ({
+    ...txn,
+    balance_after: balanceAfterById.get(txn.id) ?? null,
+  }));
 
   const categoryUsage = ((usageRes.data ?? []) as Array<{ category_id: string | null }>).reduce(
     (acc, row) => {
@@ -551,9 +639,10 @@ export async function GET(request: NextRequest) {
       color: includeColor ? category.color ?? null : null,
     })),
     loans,
-    txns,
+    txns: txnsWithBalance,
     category_usage: categoryUsage,
     recurring_month_paid: recurringMonthPaid,
     recurring_month_to_pay: recurringMonthToPay,
+    reserved_goal_amount: reservedGoalAmount,
   });
 }

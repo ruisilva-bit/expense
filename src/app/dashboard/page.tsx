@@ -7,25 +7,35 @@ import { AppDialog } from "@/components/AppDialog";
 import { AppNav } from "@/components/AppNav";
 import {
   AccountSpendingChart,
+  CashFlowTrendChart,
   CategoryChart,
   CategoryPercentageChart,
-  MonthlyTrendChart,
 } from "@/components/FamilyCharts";
 import { TransactionWizard } from "@/components/TransactionWizard";
 import { useAppState } from "@/context/AppState";
+import { buildCashFlowTrend } from "@/lib/cash-flow-trend";
 import { resolveCategoryColor } from "@/lib/category-color";
 import { fetchClientJson, getClientAuthHeaders } from "@/lib/client-fetch";
+import {
+  calculateNetBalance,
+  calculateTotalReceived,
+  inferAccountTransferSide as inferTransferSide,
+  sumFinancialTransactions,
+} from "@/lib/financial-totals";
 import { formatEur } from "@/lib/format";
 
 type Preset = "this_month" | "last_month" | "this_year" | "all" | "custom";
+type FlowFilter = "all" | "in" | "out";
 type ChartDatum = { name: string; value: number; color?: string | null };
 type CategoryPercentageDatum = { name: string; percentage: number; value: number; color?: string | null };
-type MonthlyDatum = { month: string; income: number; expense: number; net: number };
 type Txn = {
   id: string;
+  bank_account_id?: string | null;
   amount: number;
   type: "income" | "expense" | "transfer";
   transfer_side?: "source" | "dest" | null;
+  goal_move_type?: "allocate" | "release" | "spend" | null;
+  balance_after?: number | null;
   date: string | null;
   description: string | null;
   assigned_to: string | null;
@@ -48,14 +58,7 @@ type DashboardPayload = {
   category_usage?: Record<string, number>;
   recurring_month_paid?: number;
   recurring_month_to_pay?: number;
-};
-
-const inferTransferSide = (txn: Pick<Txn, "transfer_side" | "description">) => {
-  if (txn.transfer_side === "source" || txn.transfer_side === "dest") return txn.transfer_side;
-  const text = (txn.description ?? "").toLowerCase();
-  if (text.includes("transfer to")) return "source";
-  if (text.includes("transfer from")) return "dest";
-  return null;
+  reserved_goal_amount?: number;
 };
 
 const toIsoDate = (date: Date) => {
@@ -133,12 +136,6 @@ const fetchFamilyData = async (query: string) => {
   });
 };
 
-const monthLabel = (month: string) => {
-  const [year, mon] = month.split("-");
-  const parsed = new Date(Number(year), Number(mon) - 1, 1);
-  return parsed.toLocaleDateString("en-GB", { month: "short", year: "2-digit" });
-};
-
 const toggleMultiValue = (current: string[], value: string, allValues: string[]) => {
   if (!allValues.length) return [];
 
@@ -163,6 +160,7 @@ export default function DashboardPage() {
   const [customTo, setCustomTo] = useState("");
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
   const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
+  const [flowFilter, setFlowFilter] = useState<FlowFilter>("all");
   const [excludedCategoryIds, setExcludedCategoryIds] = useState<string[]>([]);
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
@@ -191,6 +189,21 @@ export default function DashboardPage() {
 
   const txns = useMemo(() => data?.txns ?? [], [data?.txns]);
   const excludedCategorySet = useMemo(() => new Set(excludedCategoryIds), [excludedCategoryIds]);
+  const flowFilteredTxns = useMemo(
+    () =>
+      txns.filter((txn) => {
+        if (flowFilter === "all") return true;
+        if (txn.type === "income") return flowFilter === "in";
+        if (txn.type === "expense") return flowFilter === "out";
+        if (txn.goal_move_type === "release") return flowFilter === "in";
+        if (txn.goal_move_type === "allocate" || txn.goal_move_type === "spend") return flowFilter === "out";
+        const side = inferTransferSide(txn);
+        if (side === "dest") return flowFilter === "in";
+        if (side === "source") return flowFilter === "out";
+        return false;
+      }),
+    [txns, flowFilter]
+  );
   const filteredTxns = useMemo(
     () =>
       txns.filter((txn) => {
@@ -201,20 +214,10 @@ export default function DashboardPage() {
     [txns, excludedCategorySet]
   );
 
-  const totals = txns.reduce(
-    (acc, txn) => {
-      if (txn.type === "income") acc.in += Number(txn.amount ?? 0);
-      if (txn.type === "expense") acc.out += Number(txn.amount ?? 0);
-      if (txn.type === "transfer") {
-        const side = inferTransferSide(txn);
-        if (side === "dest") acc.in += Number(txn.amount ?? 0);
-        if (side === "source") acc.in -= Number(txn.amount ?? 0);
-      }
-      return acc;
-    },
-    { in: 0, out: 0 }
-  );
-  const net = totals.in - totals.out;
+  const totals = sumFinancialTransactions(txns);
+  const totalReceived = calculateTotalReceived(totals);
+  const totalSpent = totals.spent;
+  const net = calculateNetBalance(totals);
   const recurringMonthPaid = Number(data?.recurring_month_paid ?? 0);
   const recurringMonthUpcoming = Number(data?.recurring_month_to_pay ?? 0);
   const recurringMonthPlanned = recurringMonthPaid + recurringMonthUpcoming;
@@ -229,6 +232,7 @@ export default function DashboardPage() {
       return sum + Number(account.balance ?? 0);
     }, 0);
   })();
+  const reservedGoals = Number(data?.reserved_goal_amount ?? 0);
   const resolveTxnColor = (category: Txn["category"] | undefined) =>
     resolveCategoryColor(category?.color, category?.name ?? "category");
 
@@ -277,30 +281,14 @@ export default function DashboardPage() {
       .sort((a, b) => b.percentage - a.percentage);
   })();
 
-  const monthlyTrend: MonthlyDatum[] = (() => {
-    const byMonth = new Map<string, { income: number; expense: number }>();
-    filteredTxns.forEach((txn) => {
-      if (!txn.date) return;
-      const month = txn.date.slice(0, 7);
-      const bucket = byMonth.get(month) ?? { income: 0, expense: 0 };
-      if (txn.type === "income") bucket.income += Number(txn.amount ?? 0);
-      if (txn.type === "expense") bucket.expense += Number(txn.amount ?? 0);
-      if (txn.type === "transfer") {
-        const side = inferTransferSide(txn);
-        if (side === "dest") bucket.income += Number(txn.amount ?? 0);
-        if (side === "source") bucket.income -= Number(txn.amount ?? 0);
-      }
-      byMonth.set(month, bucket);
+  const cashFlowTrend = useMemo(() => {
+    const { dateFrom, dateTo } = getPresetRange(preset, customFrom, customTo);
+    return buildCashFlowTrend({
+      transactions: filteredTxns,
+      dateFrom,
+      dateTo,
     });
-    return Array.from(byMonth.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([month, value]) => ({
-        month: monthLabel(month),
-        income: value.income,
-        expense: value.expense,
-        net: value.income - value.expense,
-      }));
-  })();
+  }, [filteredTxns, preset, customFrom, customTo]);
 
   const categoryUsageCount =
     data?.category_usage ??
@@ -312,7 +300,7 @@ export default function DashboardPage() {
       }, new Map<string, number>())
     );
 
-  const recentTransactions = txns.slice(0, 10);
+  const recentTransactions = flowFilteredTxns.slice(0, 10);
   const excludedCategoryNames = useMemo(() => {
     if (!excludedCategoryIds.length) return "None";
     const map = new Map((data?.categories ?? []).map((category) => [category.id, category.name]));
@@ -323,36 +311,39 @@ export default function DashboardPage() {
   }, [excludedCategoryIds, data?.categories]);
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen app-shell">
       <AppNav />
-      <main className="mx-auto max-w-6xl space-y-6 px-4 py-8 pb-24 lg:pl-64">
-        <div>
-          <p className="text-sm text-slate-500">Dashboard</p>
-          <h1 className="text-2xl font-semibold">{selectedFamily?.name ?? "Select a family"}</h1>
+      <main className="app-main page-dashboard max-w-6xl space-y-8 pb-24">
+        <div className="page-header">
+          <div>
+            <p className="page-kicker">Dashboard</p>
+            <h1 className="page-title">{selectedFamily?.name ?? "Select a family"}</h1>
+            <p className="page-subtitle">Household balances, goals, recurring costs, and recent movement.</p>
+          </div>
         </div>
 
         {familiesError && (
-          <div className="card p-3 text-sm text-red-700 bg-red-50 border-red-200">
+          <div className="status-banner status-banner-error">
             Family load error: {familiesError}
           </div>
         )}
 
         {error && (
-          <div className="card p-3 text-sm text-red-700 bg-red-50 border-red-200">
+          <div className="status-banner status-banner-error">
             Dashboard error: {error.message}
           </div>
         )}
 
         {!selectedFamily && !isFamiliesLoading && (
-          <div className="card p-4 text-slate-700">Select a family first.</div>
+          <div className="empty-state">Select a family first.</div>
         )}
 
         {(isFamiliesLoading || (!data && !error && selectedFamily)) && (
-          <div className="p-6 space-y-4">
-            <div className="h-8 w-48 bg-slate-200 animate-pulse rounded" />
+          <div className="loading-state space-y-4">
+            <div className="skeleton-block h-8 w-48" />
             <div className="grid gap-4 sm:grid-cols-2">
               {Array.from({ length: 4 }).map((_, idx) => (
-                <div key={idx} className="h-32 bg-slate-200 animate-pulse rounded-xl" />
+                <div key={idx} className="skeleton-block h-32" />
               ))}
             </div>
           </div>
@@ -360,7 +351,7 @@ export default function DashboardPage() {
 
         {selectedFamily && data && (
           <>
-            <section className="card p-2.5 space-y-2 bg-white text-slate-900 dark:bg-slate-900/60">
+            <section className="card ledger-control-sheet space-y-2 p-3 bg-white text-slate-900 dark:bg-slate-900/60">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-100">Quick and custom filters</h2>
                 <button
@@ -385,7 +376,7 @@ export default function DashboardPage() {
                     type="button"
                     className={`px-2.5 py-1.5 text-sm rounded-full border transition-colors ${
                       preset === option.id
-                        ? "bg-emerald-600 text-white border-emerald-600"
+                        ? "bg-emerald-700 text-white border-emerald-700"
                         : "border-slate-400 bg-white text-slate-800 hover:bg-slate-100 dark:border-slate-600/50 dark:bg-transparent dark:text-slate-100 dark:hover:bg-slate-800/60"
                     }`}
                     onClick={() => setPreset(option.id as Preset)}
@@ -395,17 +386,20 @@ export default function DashboardPage() {
                 ))}
               </div>
 
+
               {preset === "custom" && (
                 <div className="grid gap-2 sm:grid-cols-3">
                   <input
                     className="input h-9 text-sm"
                     type="date"
+                    aria-label="From date"
                     value={customFromDraft}
                     onChange={(event) => setCustomFromDraft(event.target.value)}
                   />
                   <input
                     className="input h-9 text-sm"
                     type="date"
+                    aria-label="To date"
                     value={customToDraft}
                     onChange={(event) => setCustomToDraft(event.target.value)}
                   />
@@ -427,7 +421,7 @@ export default function DashboardPage() {
                 <div className="rounded-md border border-slate-300 dark:border-slate-200/30 bg-slate-50 dark:bg-slate-900/30 p-2 space-y-1">
                   <div className="flex items-center justify-between">
                     <p className="text-sm font-semibold text-slate-700 dark:text-slate-100">Account(s)</p>
-                    <button type="button" className="text-sm text-emerald-600 dark:text-emerald-400" onClick={() => setSelectedAccountIds([])}>
+                    <button type="button" className="text-sm text-emerald-700 dark:text-emerald-400" onClick={() => setSelectedAccountIds([])}>
                       All
                     </button>
                   </div>
@@ -441,7 +435,7 @@ export default function DashboardPage() {
                           type="button"
                           className={`px-2.5 py-1.5 text-sm rounded-full border ${
                             selected
-                              ? "bg-emerald-600 text-white border-emerald-600"
+                              ? "bg-emerald-700 text-white border-emerald-700"
                               : "border-slate-400 bg-white text-slate-800 hover:bg-slate-100 dark:border-slate-600/50 dark:bg-transparent dark:text-slate-200 dark:hover:bg-slate-800/60"
                           }`}
                           onClick={() =>
@@ -464,7 +458,7 @@ export default function DashboardPage() {
                 <div className="rounded-md border border-slate-300 dark:border-slate-200/30 bg-slate-50 dark:bg-slate-900/30 p-2 space-y-1">
                   <div className="flex items-center justify-between">
                     <p className="text-sm font-semibold text-slate-700 dark:text-slate-100">User(s)</p>
-                    <button type="button" className="text-sm text-emerald-600 dark:text-emerald-400" onClick={() => setSelectedMemberIds([])}>
+                    <button type="button" className="text-sm text-emerald-700 dark:text-emerald-400" onClick={() => setSelectedMemberIds([])}>
                       All
                     </button>
                   </div>
@@ -478,7 +472,7 @@ export default function DashboardPage() {
                           type="button"
                           className={`px-2.5 py-1.5 text-sm rounded-full border ${
                             selected
-                              ? "bg-emerald-600 text-white border-emerald-600"
+                              ? "bg-emerald-700 text-white border-emerald-700"
                               : "border-slate-400 bg-white text-slate-800 hover:bg-slate-100 dark:border-slate-600/50 dark:bg-transparent dark:text-slate-200 dark:hover:bg-slate-800/60"
                           }`}
                           onClick={() =>
@@ -511,7 +505,7 @@ export default function DashboardPage() {
                     <span className="text-xs text-slate-500 dark:text-slate-400">Excluded: {excludedCategoryNames}</span>
                     <button
                       type="button"
-                      className="ml-auto text-xs text-emerald-600 dark:text-emerald-400"
+                      className="ml-auto text-xs text-emerald-700 dark:text-emerald-400"
                       onClick={() => setExcludedCategoryIds([])}
                     >
                       Clear
@@ -523,14 +517,14 @@ export default function DashboardPage() {
             </section>
 
             <section className="space-y-4">
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="ledger-metrics grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
                 <div className="card p-4 border border-emerald-200 dark:border-emerald-400/20 bg-emerald-50 dark:bg-emerald-500/[0.08]">
                   <p className="text-xs uppercase tracking-wide text-emerald-700 dark:text-emerald-200/90">Total received</p>
-                  <p className="mt-2 text-2xl font-semibold text-emerald-900 dark:text-emerald-50">{formatEur(totals.in)}</p>
+                  <p className="mt-2 text-2xl font-semibold text-emerald-900 dark:text-emerald-50">{formatEur(totalReceived)}</p>
                 </div>
                 <div className="card p-4 border border-rose-200 dark:border-rose-400/20 bg-rose-50 dark:bg-rose-500/[0.08]">
                   <p className="text-xs uppercase tracking-wide text-rose-700 dark:text-rose-200/90">Total spent</p>
-                  <p className="mt-2 text-2xl font-semibold text-rose-900 dark:text-rose-50">{formatEur(totals.out)}</p>
+                  <p className="mt-2 text-2xl font-semibold text-rose-900 dark:text-rose-50">{formatEur(totalSpent)}</p>
                 </div>
                 <div className="card p-4 border border-sky-200 dark:border-sky-400/20 bg-sky-50 dark:bg-sky-500/[0.08]">
                   <p className="text-xs uppercase tracking-wide text-sky-700 dark:text-sky-200/90">Net balance</p>
@@ -539,8 +533,12 @@ export default function DashboardPage() {
                   </p>
                 </div>
                 <div className="card p-4 border border-slate-300 dark:border-slate-200/20 bg-slate-100 dark:bg-slate-500/[0.08]">
-                  <p className="text-xs uppercase tracking-wide text-slate-700 dark:text-slate-300">Current balance</p>
+                  <p className="text-xs uppercase tracking-wide text-slate-700 dark:text-slate-300">Account balance</p>
                   <p className="mt-2 text-2xl font-semibold text-slate-900 dark:text-slate-50">{formatEur(currentBalance)}</p>
+                </div>
+                <div className="card p-4 border border-violet-200 dark:border-violet-400/20 bg-gradient-to-br from-violet-50 to-fuchsia-50 dark:from-violet-500/[0.10] dark:to-fuchsia-500/[0.06]">
+                  <p className="text-xs uppercase tracking-wide text-violet-700 dark:text-violet-200/90">Savings</p>
+                  <p className="mt-2 text-2xl font-semibold text-violet-900 dark:text-violet-50">{formatEur(reservedGoals)}</p>
                 </div>
               </div>
 
@@ -549,30 +547,37 @@ export default function DashboardPage() {
                   <h3 className="text-base font-semibold text-slate-800 dark:text-slate-50">Recurring this month</h3>
                   <span className="text-xs text-slate-500 dark:text-slate-300">{recurringProgress.toFixed(0)}% completed</span>
                 </div>
-                <div className="h-2 w-full overflow-hidden rounded-full bg-slate-300 dark:bg-slate-700/70">
+                <div className="recurring-progress-track h-2 w-full overflow-hidden rounded-full bg-slate-300 dark:bg-slate-700/70">
                   <div
-                    className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-cyan-400 transition-all"
+                    className="recurring-progress-fill h-full rounded-full transition-all"
                     style={{ width: `${Math.min(Math.max(recurringProgress, 0), 100)}%` }}
+                    role="progressbar"
+                    aria-label="Recurring expenses completed this month"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={Math.round(recurringProgress)}
                   />
                 </div>
                 <div className="grid gap-3 sm:grid-cols-3">
                   <div className="rounded-lg border border-slate-300 dark:border-slate-200/20 bg-white dark:bg-slate-900/30 p-3">
-                    <p className="text-xs text-slate-600 dark:text-slate-400">Paid</p>
-                    <p className="mt-1 text-xl font-semibold text-emerald-600 dark:text-emerald-300">{formatEur(recurringMonthPaid)}</p>
+                    <p className="text-xs text-slate-600 dark:text-slate-400">Pago</p>
+                    <p className="mt-1 text-xl font-semibold text-emerald-700 dark:text-emerald-300">{formatEur(recurringMonthPaid)}</p>
                   </div>
                   <div className="rounded-lg border border-slate-300 dark:border-slate-200/20 bg-white dark:bg-slate-900/30 p-3">
-                    <p className="text-xs text-slate-600 dark:text-slate-400">Upcoming</p>
+                    <p className="text-xs text-slate-600 dark:text-slate-400">Por pagar</p>
                     <p className="mt-1 text-xl font-semibold text-slate-800 dark:text-slate-100">{formatEur(recurringMonthUpcoming)}</p>
                   </div>
                   <div className="rounded-lg border border-slate-300 dark:border-slate-200/20 bg-white dark:bg-slate-900/30 p-3">
-                    <p className="text-xs text-slate-600 dark:text-slate-400">Planned total</p>
-                    <p className={`mt-1 text-xl font-semibold ${recurringMonthPlanned > 0 ? "text-cyan-600 dark:text-cyan-300" : "text-slate-500 dark:text-slate-300"}`}>
+                    <p className="text-xs text-slate-600 dark:text-slate-400">Total planeado</p>
+                    <p className={`mt-1 text-xl font-semibold ${recurringMonthPlanned > 0 ? "text-cyan-700 dark:text-cyan-300" : "text-slate-500 dark:text-slate-300"}`}>
                       {formatEur(recurringMonthPlanned)}
                     </p>
                   </div>
                 </div>
               </div>
             </section>
+
+            <CashFlowTrendChart data={cashFlowTrend.data} granularity={cashFlowTrend.granularity} />
 
             <CategoryChart data={categoryChart} />
 
@@ -581,13 +586,29 @@ export default function DashboardPage() {
               <AccountSpendingChart data={accountSpendingChart} />
             </div>
 
-            <div className="grid gap-4">
-              <MonthlyTrendChart data={monthlyTrend} />
-            </div>
-
             <section className="card p-4 space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="text-lg font-semibold">Recent activity</h3>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-lg font-semibold">Recent activity</h3>
+                  {[
+                    { id: "all", label: "All" },
+                    { id: "in", label: "In" },
+                    { id: "out", label: "Out" },
+                  ].map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      className={`px-2.5 py-1.5 text-sm rounded-full border transition-colors ${
+                        flowFilter === option.id
+                          ? "bg-sky-700 text-white border-sky-700"
+                          : "border-slate-300 bg-white text-slate-700 hover:bg-slate-100 dark:border-slate-600/50 dark:bg-transparent dark:text-slate-100 dark:hover:bg-slate-800/60"
+                      }`}
+                      onClick={() => setFlowFilter(option.id as FlowFilter)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
                 <Link href="/transactions" className="btn btn-ghost text-sm">
                   Ver mais
                 </Link>
@@ -607,29 +628,34 @@ export default function DashboardPage() {
                         <p className="text-xs text-slate-500">{txn.date} · {txn.bank_account?.name}</p>
                         {txn.loan?.name && <p className="text-xs text-amber-700">Loan: {txn.loan.name}</p>}
                       </div>
-                      <div
-                        className={`text-right font-semibold ${
-                          txn.type === "income"
-                            ? "text-emerald-700"
+                      <div className="text-right">
+                        <p
+                          className={`font-semibold ${
+                            txn.type === "income"
+                              ? "text-emerald-700"
+                              : txn.type === "expense"
+                                ? "text-red-600"
+                                : transferSide === "dest"
+                                  ? "text-emerald-700"
+                                  : transferSide === "source"
+                                    ? "text-red-600"
+                                    : "text-slate-700"
+                          }`}
+                        >
+                          {txn.type === "income"
+                            ? "+"
                             : txn.type === "expense"
-                              ? "text-red-600"
+                              ? "-"
                               : transferSide === "dest"
-                                ? "text-emerald-700"
+                                ? "+"
                                 : transferSide === "source"
-                                  ? "text-red-600"
-                                  : "text-slate-700"
-                        }`}
-                      >
-                        {txn.type === "income"
-                          ? "+"
-                          : txn.type === "expense"
-                            ? "-"
-                            : transferSide === "dest"
-                              ? "+"
-                              : transferSide === "source"
-                                ? "-"
-                                : "↔ "}
-                        {formatEur(Number(txn.amount ?? 0))}
+                                  ? "-"
+                                  : "↔ "}
+                          {formatEur(Number(txn.amount ?? 0))}
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          Saldo ap&oacute;s: {txn.balance_after == null ? "-" : formatEur(txn.balance_after)}
+                        </p>
                       </div>
                     </li>
                   );
@@ -642,7 +668,7 @@ export default function DashboardPage() {
               <>
                 <button
                   type="button"
-                  className="fixed bottom-4 right-4 z-40 h-14 w-14 rounded-full bg-emerald-600 text-3xl leading-none text-white shadow-lg hover:bg-emerald-700 sm:bottom-6 sm:right-6 lg:right-8"
+                  className="fixed bottom-4 right-4 z-40 h-14 w-14 rounded-full bg-emerald-700 text-3xl leading-none text-white shadow-lg hover:bg-emerald-800 sm:bottom-6 sm:right-6 lg:right-8"
                   onClick={() => setIsWizardOpen(true)}
                   aria-label="Create transaction"
                 >

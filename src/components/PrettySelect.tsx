@@ -52,7 +52,7 @@ export function PrettySelect({ value, onChange, options, placeholder, disabled =
         className="input flex h-10 items-center justify-between gap-3 text-left disabled:cursor-not-allowed disabled:bg-slate-100"
         onClick={() => setOpen((current) => !current)}
       >
-        <span className="min-w-0 truncate text-sm text-slate-800">
+        <span className="min-w-0 truncate text-sm">
           {selected ? (
             <span className="inline-flex items-center gap-2">
               {selected.color && (
@@ -72,7 +72,7 @@ export function PrettySelect({ value, onChange, options, placeholder, disabled =
       </button>
 
       {open && (
-        <div className="absolute z-40 mt-1 w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
+        <div className="select-menu absolute z-40 mt-1 w-full">
           <ul className="max-h-64 overflow-y-auto py-1">
             {options.map((option) => {
               const isSelected = option.value === value;
@@ -80,9 +80,8 @@ export function PrettySelect({ value, onChange, options, placeholder, disabled =
                 <li key={option.value}>
                   <button
                     type="button"
-                    className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
-                      isSelected ? "bg-emerald-50 text-emerald-700" : "text-slate-700 hover:bg-slate-50"
-                    }`}
+                    className="select-option flex w-full items-center gap-2 px-3 py-2 text-left text-sm"
+                    data-active={isSelected}
                     onClick={() => {
                       onChange(option.value);
                       setOpen(false);

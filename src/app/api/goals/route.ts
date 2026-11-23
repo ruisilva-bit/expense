@@ -6,11 +6,12 @@ import {
   ensureFamilyMember,
   getAccessibleAccountIds,
   getAccount,
-  getCategory,
-  getLoan,
   getRequestUser,
   todayIsoDate,
 } from "@/lib/api-auth";
+import { type GoalMoveType } from "@/lib/goal-moves";
+import { IDEMPOTENCY_KEY_HEADER, normalizeIdempotencyKey } from "@/lib/goal-movement-idempotency";
+import { toMoneyCents } from "@/lib/goal-movement-state";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
 type GoalRow = {
@@ -23,20 +24,6 @@ type GoalRow = {
   account_id?: string | null;
 };
 
-const LOAN_TAG_REGEX = /\s*\[loan:([0-9a-fA-F-]{36})\]\s*$/;
-
-const stripLoanTag = (description: string | null | undefined) => {
-  if (!description) return null;
-  const stripped = description.replace(LOAN_TAG_REGEX, "").trim();
-  return stripped || null;
-};
-
-const withLoanTag = (description: string | null, loanId: string | null) => {
-  const base = stripLoanTag(description);
-  if (!loanId) return base;
-  return base ? `${base} [loan:${loanId}]` : `[loan:${loanId}]`;
-};
-
 const normalizeGoal = (goal: GoalRow) => ({
   id: goal.id,
   name: goal.name ?? "Goal",
@@ -46,22 +33,23 @@ const normalizeGoal = (goal: GoalRow) => ({
   bank_account_id: goal.bank_account_id ?? goal.account_id ?? null,
 });
 
-async function listGoalsForFamily(familyId: string) {
-  const admin = supabaseAdmin();
-  const accountsRes = await admin.from("bank_accounts").select("id").eq("family_id", familyId);
-  if (accountsRes.error) return { goals: null, error: accountsRes.error.message };
-  const accountIds = (accountsRes.data ?? []).map((account) => account.id);
+const pickGoalId = (payload: { goalId?: string; id?: string } | null | undefined) =>
+  (payload?.goalId ?? payload?.id ?? "").trim();
+
+const pickBankAccountId = (payload: { bank_account_id?: string; accountId?: string } | null | undefined) =>
+  (payload?.bank_account_id ?? payload?.accountId ?? "").trim();
+
+async function listGoalsForAccounts(accountIds: string[]) {
   if (!accountIds.length) return { goals: [] as ReturnType<typeof normalizeGoal>[], error: null };
 
-  const goalsRes = await admin.from("goals").select("*").order("created_at", { ascending: false });
+  const goalsRes = await supabaseAdmin()
+    .from("goals")
+    .select("*")
+    .in("bank_account_id", accountIds)
+    .order("current_amount", { ascending: false })
+    .order("name", { ascending: true });
   if (goalsRes.error) return { goals: null, error: goalsRes.error.message };
-
-  const allowed = new Set(accountIds);
-  const goals = ((goalsRes.data ?? []) as GoalRow[]).filter((goal) => {
-    const accountId = goal.bank_account_id ?? goal.account_id ?? null;
-    return accountId ? allowed.has(accountId) : false;
-  });
-  return { goals: goals.map(normalizeGoal), error: null };
+  return { goals: ((goalsRes.data ?? []) as GoalRow[]).map(normalizeGoal), error: null };
 }
 
 async function resolveFamilyForGoal(goalId: string) {
@@ -89,46 +77,110 @@ async function resolveFamilyForGoal(goalId: string) {
   };
 }
 
-async function applyAccountDelta(accountId: string, delta: number) {
-  if (!delta) return { ok: true as const };
+type GoalMovementRpcResult = {
+  goal?: GoalRow;
+  replayed?: boolean;
+};
 
-  const account = await getAccount(accountId);
-  if (account.error || !account.data) {
-    return { ok: false as const, error: account.error ?? "Bank account not found." };
+type GoalMovementRpcError = {
+  code?: string;
+  message?: string;
+};
+
+const movementRpcError = (error: GoalMovementRpcError) => {
+  const message = error.message ?? "";
+  const lower = message.toLowerCase();
+
+  if (error.code === "PGRST202" || (lower.includes("apply_goal_movement_v1") && lower.includes("schema cache"))) {
+    return {
+      status: 503,
+      message: "A atualização de movimentos seguros ainda não está instalada. Nenhum valor foi alterado.",
+    };
+  }
+  if (message.includes("HOMEFUND_IDEMPOTENCY_CONFLICT")) {
+    return { status: 409, message: "Esta chave de operação já foi usada com dados diferentes." };
+  }
+  if (message.includes("HOMEFUND_INSUFFICIENT")) {
+    return { status: 409, message: "A poupança não tem saldo suficiente para esse movimento." };
+  }
+  if (message.includes("HOMEFUND_FORBIDDEN")) {
+    return { status: 403, message: "Não tens permissão para alterar esta poupança." };
+  }
+  if (message.includes("HOMEFUND_NOT_FOUND")) {
+    return { status: 404, message: "A poupança ou um dos registos associados já não existe." };
+  }
+  if (message.includes("HOMEFUND_INVALID")) {
+    return { status: 400, message: "Os dados do movimento são inválidos. Atualiza a página e tenta novamente." };
+  }
+  if (message.includes("HOMEFUND_CONFLICT")) {
+    return { status: 409, message: "Os dados financeiros mudaram durante o pedido. Atualiza a página e tenta novamente." };
   }
 
-  const admin = supabaseAdmin();
-  const nextBalance = asNumber(account.data.balance) + delta;
-  const update = await admin.from("bank_accounts").update({ balance: nextBalance }).eq("id", accountId);
-  if (update.error) return { ok: false as const, error: update.error.message };
+  return {
+    status: 503,
+    message: "Não foi possível registar o movimento de forma atómica. Nenhum valor foi alterado; podes tentar novamente.",
+  };
+};
 
-  return { ok: true as const };
-}
+async function registerGoalMovement(input: {
+  operationId: string;
+  familyId: string;
+  goalId: string;
+  bankAccountId: string;
+  userId: string;
+  amount: number;
+  moveType: GoalMoveType;
+  categoryId?: string | null;
+  loanId?: string | null;
+  description?: string | null;
+  date?: string | null;
+  assignedTo?: string | null;
+}) {
+  const admin = supabaseAdmin() as unknown as {
+    rpc: (
+      name: string,
+      args: Record<string, unknown>
+    ) => Promise<{ data: unknown; error: GoalMovementRpcError | null }>;
+  };
+  const { data, error } = await admin.rpc("apply_goal_movement_v1", {
+    p_operation_id: input.operationId,
+    p_family_id: input.familyId,
+    p_goal_id: input.goalId,
+    p_bank_account_id: input.bankAccountId,
+    p_user_id: input.userId,
+    p_move_type: input.moveType,
+    p_amount_cents: toMoneyCents(input.amount),
+    p_movement_date: (input.date ?? todayIsoDate()).slice(0, 10),
+    p_description: input.description?.trim() || null,
+    p_category_id: input.categoryId?.trim() || null,
+    p_loan_id: input.loanId?.trim() || null,
+    p_requested_assigned_to: input.assignedTo?.trim() || null,
+  });
 
-async function applyLoanRemainingDelta(loanId: string, delta: number) {
-  if (!delta) return { ok: true as const };
-
-  const loan = await getLoan(loanId);
-  if (loan.error || !loan.data) {
-    return { ok: false as const, error: loan.error ?? "Loan not found." };
+  if (error) {
+    const mapped = movementRpcError(error);
+    return { ok: false as const, error: mapped.message, status: mapped.status };
   }
-  if (!loan.data.family_id) {
-    return { ok: false as const, error: "Loan is missing family_id." };
+
+  const raw = (Array.isArray(data) ? data[0] : data) as GoalMovementRpcResult | null;
+  if (!raw?.goal?.id) {
+    return {
+      ok: false as const,
+      status: 503,
+      error: "A base de dados não confirmou o movimento. Nenhum novo pedido será criado automaticamente.",
+    };
   }
 
-  const admin = supabaseAdmin();
-  const currentRemaining = asNumber(loan.data.remaining_amount, asNumber(loan.data.total_amount));
-  const nextRemaining = Math.max(0, currentRemaining + delta);
-  const update = await admin.from("loans").update({ remaining_amount: nextRemaining }).eq("id", loanId);
-  if (update.error) {
-    return { ok: false as const, error: update.error.message };
-  }
-
-  return { ok: true as const };
+  return {
+    ok: true as const,
+    goal: normalizeGoal(raw.goal),
+    replayed: Boolean(raw.replayed),
+  };
 }
 
 export async function GET(request: NextRequest) {
   const familyId = (request.nextUrl.searchParams.get("familyId") ?? "").trim();
+  const goalId = (request.nextUrl.searchParams.get("goalId") ?? request.nextUrl.searchParams.get("id") ?? "").trim();
   if (!familyId) {
     return NextResponse.json({ error: "familyId is required." }, { status: 400 });
   }
@@ -146,17 +198,20 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: access.error ?? "Failed to load account access." }, { status: 400 });
   }
   if (!access.accountIds.length) {
-    return NextResponse.json({ goals: [] });
+    return goalId ? NextResponse.json({ error: "Goal not found." }, { status: 404 }) : NextResponse.json({ goals: [] });
   }
 
-  const listing = await listGoalsForFamily(familyId);
+  const listing = await listGoalsForAccounts(access.accountIds);
   if (listing.error) return NextResponse.json({ error: listing.error }, { status: 400 });
-  const allowedSet = new Set(access.accountIds);
-  return NextResponse.json({
-    goals: (listing.goals ?? []).filter((goal) =>
-      goal.bank_account_id ? allowedSet.has(goal.bank_account_id) : false
-    ),
-  });
+  const goals = listing.goals ?? [];
+
+  if (goalId) {
+    const goal = goals.find((entry) => entry.id === goalId) ?? null;
+    if (!goal) return NextResponse.json({ error: "Goal not found." }, { status: 404 });
+    return NextResponse.json({ goal });
+  }
+
+  return NextResponse.json({ goals });
 }
 
 export async function POST(request: Request) {
@@ -166,6 +221,7 @@ export async function POST(request: Request) {
   const payload = (await request.json().catch(() => ({}))) as {
     familyId?: string;
     bank_account_id?: string;
+    accountId?: string;
     name?: string;
     target_amount?: number;
     current_amount?: number;
@@ -173,7 +229,7 @@ export async function POST(request: Request) {
   };
 
   const familyId = (payload.familyId ?? "").trim();
-  const bankAccountId = (payload.bank_account_id ?? "").trim();
+  const bankAccountId = pickBankAccountId(payload);
   const name = (payload.name ?? "").trim();
   const target = Math.max(0, asNumber(payload.target_amount));
   const current = Math.max(0, asNumber(payload.current_amount));
@@ -251,19 +307,29 @@ export async function PATCH(request: Request) {
 
   const payload = (await request.json().catch(() => ({}))) as {
     goalId?: string;
+    id?: string;
     name?: string;
     target_amount?: number;
     current_amount?: number;
     deadline?: string | null;
     bank_account_id?: string;
+    accountId?: string;
     contribution_amount?: number;
     contribution_category_id?: string | null;
     contribution_loan_id?: string | null;
     contribution_description?: string | null;
     contribution_date?: string;
+    movement_type?: GoalMoveType;
+    movement_amount?: number;
+    movement_category_id?: string | null;
+    movement_loan_id?: string | null;
+    movement_description?: string | null;
+    movement_date?: string;
+    movement_assigned_to?: string | null;
+    operation_id?: string;
   };
 
-  const goalId = (payload.goalId ?? "").trim();
+  const goalId = pickGoalId(payload);
   if (!goalId) return NextResponse.json({ error: "goalId is required." }, { status: 400 });
 
   const resolved = await resolveFamilyForGoal(goalId);
@@ -284,8 +350,77 @@ export async function PATCH(request: Request) {
     return NextResponse.json({ error: "You do not have access to this goal account." }, { status: 403 });
   }
 
+  const movementTypeInput = payload.movement_type ?? (payload.contribution_amount !== undefined ? "allocate" : undefined);
+  const movementAmountRaw =
+    payload.movement_amount !== undefined
+      ? payload.movement_amount
+      : payload.contribution_amount !== undefined
+        ? payload.contribution_amount
+        : undefined;
+  const isMovementRequest = movementTypeInput !== undefined || movementAmountRaw !== undefined;
+
+  if (isMovementRequest) {
+    if (movementTypeInput !== "allocate" && movementTypeInput !== "release" && movementTypeInput !== "spend") {
+      return NextResponse.json({ error: "movement_type is invalid." }, { status: 400 });
+    }
+    const movementAmount = asNumber(movementAmountRaw);
+    if (toMoneyCents(movementAmount) <= 0) {
+      return NextResponse.json({ error: "movement_amount must be greater than zero." }, { status: 400 });
+    }
+    if (
+      payload.name !== undefined ||
+      payload.target_amount !== undefined ||
+      payload.current_amount !== undefined ||
+      payload.deadline !== undefined ||
+      payload.bank_account_id !== undefined ||
+      payload.accountId !== undefined
+    ) {
+      return NextResponse.json(
+        { error: "Não combines um movimento financeiro com alterações aos detalhes da poupança." },
+        { status: 400 }
+      );
+    }
+    if (!existingGoalAccountId) {
+      return NextResponse.json({ error: "Goal has no bank account configured." }, { status: 400 });
+    }
+
+    const operationId = normalizeIdempotencyKey(
+      request.headers.get(IDEMPOTENCY_KEY_HEADER) ?? payload.operation_id
+    );
+    if (!operationId) {
+      return NextResponse.json(
+        { error: "É necessária uma chave Idempotency-Key UUID v4 para movimentos financeiros." },
+        { status: 400 }
+      );
+    }
+
+    const legacyAccount = await ensureLegacyAccountForBankAccount(existingGoalAccountId);
+    if (!legacyAccount.ok) {
+      return NextResponse.json({ error: legacyAccount.error }, { status: 400 });
+    }
+
+    const movement = await registerGoalMovement({
+      operationId,
+      familyId: resolved.familyId,
+      goalId,
+      bankAccountId: existingGoalAccountId,
+      userId: user.id,
+      amount: movementAmount,
+      moveType: movementTypeInput,
+      categoryId: payload.movement_category_id ?? payload.contribution_category_id ?? null,
+      loanId: payload.movement_loan_id ?? payload.contribution_loan_id ?? null,
+      description: payload.movement_description ?? payload.contribution_description ?? null,
+      date: payload.movement_date ?? payload.contribution_date ?? null,
+      assignedTo: payload.movement_assigned_to ?? null,
+    });
+
+    if (!movement.ok) {
+      return NextResponse.json({ error: movement.error }, { status: movement.status });
+    }
+    return NextResponse.json({ goal: movement.goal, replayed: movement.replayed });
+  }
+
   const updatePayload: Record<string, unknown> = {};
-  let effectiveBankAccountId = resolved.goal.bank_account_id ?? resolved.goal.account_id ?? null;
 
   if (payload.name !== undefined) updatePayload.name = payload.name.trim();
   if (payload.target_amount !== undefined) {
@@ -294,8 +429,8 @@ export async function PATCH(request: Request) {
   }
   if (payload.deadline !== undefined) updatePayload.deadline = payload.deadline ? payload.deadline.slice(0, 10) : null;
 
-  if (payload.bank_account_id !== undefined) {
-    const accountId = payload.bank_account_id.trim();
+  if (payload.bank_account_id !== undefined || payload.accountId !== undefined) {
+    const accountId = pickBankAccountId(payload);
     const account = await getAccount(accountId);
     if (account.error || !account.data) {
       return NextResponse.json({ error: account.error ?? "Bank account not found." }, { status: 404 });
@@ -311,116 +446,14 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ error: legacyAccount.error }, { status: 400 });
     }
     updatePayload.bank_account_id = accountId;
-    effectiveBankAccountId = accountId;
   }
 
-  const contributionAmount =
-    payload.contribution_amount !== undefined ? Math.max(0, asNumber(payload.contribution_amount)) : 0;
-  if (payload.current_amount !== undefined || contributionAmount > 0) {
-    const baseCurrent =
-      payload.current_amount !== undefined
-        ? Math.max(0, asNumber(payload.current_amount))
-        : Math.max(0, asNumber(resolved.goal.current_amount));
-    updatePayload.current_amount = baseCurrent + contributionAmount;
+  if (payload.current_amount !== undefined) {
+    updatePayload.current_amount = Math.max(0, asNumber(payload.current_amount));
   }
 
-  if (!Object.keys(updatePayload).length && contributionAmount <= 0) {
+  if (!Object.keys(updatePayload).length) {
     return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
-  }
-
-  if (contributionAmount > 0) {
-    if (!effectiveBankAccountId) {
-      return NextResponse.json({ error: "Goal has no bank account configured." }, { status: 400 });
-    }
-
-    const contributionCategoryId = (payload.contribution_category_id ?? "").trim();
-    const contributionLoanId = (payload.contribution_loan_id ?? "").trim();
-    let contributionCategoryAffectsLoan = false;
-    let contributionCategoryName: string | null = null;
-    if (contributionCategoryId) {
-      const category = await getCategory(contributionCategoryId);
-      if (category.error || !category.data) {
-        return NextResponse.json({ error: category.error ?? "Category not found." }, { status: 404 });
-      }
-      if (category.data.family_id !== resolved.familyId) {
-        return NextResponse.json({ error: "Category does not belong to this family." }, { status: 400 });
-      }
-      contributionCategoryAffectsLoan = Boolean(category.data.affects_loan);
-      contributionCategoryName = category.data.name;
-    }
-
-    const legacyAccount = await ensureLegacyAccountForBankAccount(effectiveBankAccountId);
-    if (!legacyAccount.ok) {
-      return NextResponse.json({ error: legacyAccount.error }, { status: 400 });
-    }
-
-    if (contributionCategoryAffectsLoan && !contributionLoanId) {
-      return NextResponse.json(
-        { error: "Selected category affects loans. Please select which loan to apply." },
-        { status: 400 }
-      );
-    }
-
-    if (contributionLoanId) {
-      const loan = await getLoan(contributionLoanId);
-      if (loan.error || !loan.data) {
-        return NextResponse.json({ error: loan.error ?? "Loan not found." }, { status: 404 });
-      }
-      if (loan.data.family_id !== resolved.familyId) {
-        return NextResponse.json({ error: "Loan does not belong to this family." }, { status: 400 });
-      }
-    }
-
-    const admin = supabaseAdmin();
-    const creatorMemberRes = await admin
-      .from("family_members")
-      .select("id")
-      .eq("family_id", resolved.familyId)
-      .eq("user_id", user.id)
-      .maybeSingle();
-    if (creatorMemberRes.error) {
-      return NextResponse.json({ error: creatorMemberRes.error.message }, { status: 400 });
-    }
-    const creatorMemberId = (creatorMemberRes.data?.id as string | undefined) ?? null;
-    const baseContributionDescription =
-      payload.contribution_description?.trim() || `Goal contribution: ${(resolved.goal.name ?? "Goal").trim() || "Goal"}`;
-
-    const transactionInsert = await admin.from("transactions").insert({
-      family_id: resolved.familyId,
-      bank_account_id: effectiveBankAccountId,
-      account_id: effectiveBankAccountId,
-      created_by: user.id,
-      user_id: user.id,
-      assigned_to: creatorMemberId,
-      amount: contributionAmount,
-      type: "expense",
-      category_id: contributionCategoryId || null,
-      category: contributionCategoryName ?? "Goal contribution",
-      description: withLoanTag(
-        baseContributionDescription,
-        contributionCategoryAffectsLoan ? contributionLoanId || null : null
-      ),
-      date: (payload.contribution_date ?? todayIsoDate()).slice(0, 10),
-    });
-
-    if (transactionInsert.error) {
-      return NextResponse.json(
-        { error: `Could not register contribution transaction: ${transactionInsert.error.message}` },
-        { status: 400 }
-      );
-    }
-
-    const balanceUpdate = await applyAccountDelta(effectiveBankAccountId, -contributionAmount);
-    if (!balanceUpdate.ok) {
-      return NextResponse.json({ error: balanceUpdate.error }, { status: 400 });
-    }
-
-    if (contributionLoanId && contributionCategoryAffectsLoan) {
-      const loanUpdate = await applyLoanRemainingDelta(contributionLoanId, -contributionAmount);
-      if (!loanUpdate.ok) {
-        return NextResponse.json({ error: loanUpdate.error }, { status: 400 });
-      }
-    }
   }
 
   const admin = supabaseAdmin();
@@ -445,8 +478,8 @@ export async function DELETE(request: Request) {
   const { user, error: userError } = await getRequestUser(request);
   if (!user) return NextResponse.json({ error: userError ?? "Not signed in." }, { status: 401 });
 
-  const payload = (await request.json().catch(() => ({}))) as { goalId?: string };
-  const goalId = (payload.goalId ?? "").trim();
+  const payload = (await request.json().catch(() => ({}))) as { goalId?: string; id?: string };
+  const goalId = pickGoalId(payload);
   if (!goalId) return NextResponse.json({ error: "goalId is required." }, { status: 400 });
 
   const resolved = await resolveFamilyForGoal(goalId);

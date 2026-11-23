@@ -7,8 +7,16 @@ import { AppNav } from "@/components/AppNav";
 import { EntityPopover } from "@/components/EntityPopover";
 import { useAppState } from "@/context/AppState";
 import { fetchClientJson, getClientAuthHeaders } from "@/lib/client-fetch";
+import { fetchAllPages } from "@/lib/fetch-all-pages";
+import {
+  calculateNetBalance,
+  calculateTotalReceived,
+  sumFinancialTransactions,
+} from "@/lib/financial-totals";
 import { formatEur } from "@/lib/format";
 import { supabaseBrowser } from "@/lib/supabase-browser";
+
+const TRANSACTIONS_PAGE_SIZE = 100;
 
 type FamilyUser = {
   id: string;
@@ -31,18 +39,12 @@ type Transaction = {
   amount: number;
   type: "income" | "expense" | "transfer";
   transfer_side?: "source" | "dest" | null;
+  goal_move_type?: "allocate" | "release" | "spend" | null;
+  balance_after?: number | null;
   description: string | null;
   date: string | null;
   category?: { id: string; name: string } | null;
   member?: { id: string; name: string } | null;
-};
-
-const inferTransferSide = (transaction: Pick<Transaction, "transfer_side" | "description">) => {
-  if (transaction.transfer_side === "source" || transaction.transfer_side === "dest") return transaction.transfer_side;
-  const text = (transaction.description ?? "").toLowerCase();
-  if (text.includes("transfer to")) return "source";
-  if (text.includes("transfer from")) return "dest";
-  return null;
 };
 
 export default function AccountsPage() {
@@ -73,10 +75,14 @@ export default function AccountsPage() {
     selectedFamily ? `account-transactions:${selectedFamily.id}` : null,
     async () => {
       const headers = await getClientAuthHeaders();
-      return fetchClientJson<{ transactions: Transaction[] }>(
-        `/api/transactions?familyId=${encodeURIComponent(selectedFamily!.id)}&page=1&pageSize=300`,
-        { method: "GET", headers }
-      );
+      const transactions = await fetchAllPages<Transaction>(async (page) => {
+        const response = await fetchClientJson<{ transactions: Transaction[]; pageSize: number }>(
+          `/api/transactions?familyId=${encodeURIComponent(selectedFamily!.id)}&page=${page}&pageSize=${TRANSACTIONS_PAGE_SIZE}`,
+          { method: "GET", headers }
+        );
+        return { items: response.transactions, pageSize: response.pageSize };
+      });
+      return { transactions };
     },
     { revalidateOnFocus: false, shouldRetryOnError: false }
   );
@@ -97,27 +103,12 @@ export default function AccountsPage() {
   }, [transactionsData?.transactions, activeAccount]);
 
   const accountMovementTotals = useMemo(
-    () =>
-      accountTransactions.reduce(
-        (acc, transaction) => {
-          const amount = Number(transaction.amount ?? 0);
-          if (transaction.type === "income") acc.income += amount;
-          if (transaction.type === "expense") acc.expense += amount;
-          if (transaction.type === "transfer") {
-            const side = inferTransferSide(transaction);
-            if (side === "dest") acc.transferIn += amount;
-            if (side === "source") acc.transferOut += amount;
-          }
-          return acc;
-        },
-        { income: 0, expense: 0, transferIn: 0, transferOut: 0 }
-      ),
+    () => sumFinancialTransactions(accountTransactions),
     [accountTransactions]
   );
-  const accountTotalReceived =
-    accountMovementTotals.income - accountMovementTotals.transferOut + accountMovementTotals.transferIn;
-  const accountTotalSpent = accountMovementTotals.expense;
-  const accountNetBalance = accountTotalReceived - accountTotalSpent;
+  const accountTotalReceived = calculateTotalReceived(accountMovementTotals);
+  const accountTotalSpent = accountMovementTotals.spent;
+  const accountNetBalance = calculateNetBalance(accountMovementTotals);
 
   const createAccount = async (formData: FormData) => {
     if (!selectedFamily) return;
@@ -266,13 +257,14 @@ export default function AccountsPage() {
   };
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen app-shell">
       <AppNav />
-      <main className="mx-auto max-w-5xl space-y-6 px-4 py-8 lg:pl-64">
-        <div className="flex items-center justify-between">
+      <main className="app-main page-accounts max-w-5xl space-y-8">
+        <div className="page-header">
           <div>
-            <p className="text-sm text-slate-500">Accounts</p>
-            <h1 className="text-2xl font-semibold">{selectedFamily?.name || "Select a family"}</h1>
+            <p className="page-kicker">Accounts</p>
+            <h1 className="page-title">{selectedFamily?.name || "Select a family"}</h1>
+            <p className="page-subtitle">Balances and account access in one clear view.</p>
           </div>
         </div>
 
@@ -280,7 +272,7 @@ export default function AccountsPage() {
 
         {selectedFamily && (
           <>
-            <form action={createAccount} className="card space-y-3 p-4">
+            <form action={createAccount} className="card editorial-form space-y-3 p-4">
               <p className="text-sm text-slate-600">Create account</p>
               <input name="name" className="input" placeholder="Account name" required />
               <input name="balance" type="number" step="0.01" className="input" placeholder="Starting balance" />
@@ -291,7 +283,7 @@ export default function AccountsPage() {
               )}
             </form>
 
-            <section className="space-y-3">
+            <section className="ledger-selector-list space-y-3">
               {accounts.map((account) => {
                 const currentAccount = account as Account;
                 return (
@@ -345,7 +337,7 @@ export default function AccountsPage() {
                   <div className="rounded-xl border border-slate-200 p-3">
                     <p className="text-xs text-slate-500">Total received</p>
                     <p className="text-lg font-semibold">{formatEur(accountTotalReceived)}</p>
-                    <p className="text-[11px] text-slate-500">income - transfer out + transfer in</p>
+                    <p className="text-[11px] text-slate-500">income - transfer out + transfer in + goal releases</p>
                   </div>
                   <div className="rounded-xl border border-slate-200 p-3">
                     <p className="text-xs text-slate-500">Total spent</p>
@@ -509,18 +501,23 @@ export default function AccountsPage() {
                               {transaction.date ?? "No date"} · {transaction.member?.name ?? "Unassigned"}
                             </p>
                           </div>
-                          <p
-                            className={`font-semibold ${
-                              transaction.type === "income"
-                                ? "text-emerald-700"
-                                : transaction.type === "expense"
-                                  ? "text-red-600"
-                                  : "text-slate-700"
-                            }`}
-                          >
-                            {transaction.type === "income" ? "+" : transaction.type === "expense" ? "-" : ""}
-                            {formatEur(Number(transaction.amount ?? 0))}
-                          </p>
+                          <div className="sm:text-right">
+                            <p
+                              className={`font-semibold ${
+                                transaction.type === "income"
+                                  ? "text-emerald-700"
+                                  : transaction.type === "expense"
+                                    ? "text-red-600"
+                                    : "text-slate-700"
+                              }`}
+                            >
+                              {transaction.type === "income" ? "+" : transaction.type === "expense" ? "-" : ""}
+                              {formatEur(Number(transaction.amount ?? 0))}
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              Saldo ap&oacute;s: {transaction.balance_after == null ? "-" : formatEur(transaction.balance_after)}
+                            </p>
+                          </div>
                         </li>
                       ))}
                     </ul>

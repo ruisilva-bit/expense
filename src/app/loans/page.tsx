@@ -2,25 +2,13 @@
 
 import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  Legend,
-  Line,
-  LineChart,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
 import { AppDialog, ConfirmDialog } from "@/components/AppDialog";
 import { AppNav } from "@/components/AppNav";
+import { LoanMemberFigure, LoanPaymentTimeline, LoanPaydownFigure } from "@/components/LoanCharts";
 import { PrettySelect } from "@/components/PrettySelect";
-import { SafeResponsiveContainer } from "@/components/SafeResponsiveContainer";
 import { useAppState } from "@/context/AppState";
 import { fetchClientJson, getClientAuthHeaders } from "@/lib/client-fetch";
-import { formatEur, formatEurAxis } from "@/lib/format";
+import { formatEur } from "@/lib/format";
 
 type Loan = {
   id: string;
@@ -39,6 +27,7 @@ type LoanTxn = {
   id: string;
   amount: number;
   type: "income" | "expense" | "transfer";
+  balance_after?: number | null;
   date: string | null;
   assigned_to: string | null;
   description: string | null;
@@ -57,16 +46,28 @@ const monthLabel = (value: string) => {
   return date.toLocaleDateString("en-GB", { month: "short", year: "2-digit" });
 };
 
-const USER_CHART_COLORS = [
-  "#06b6d4",
-  "#22c55e",
-  "#f59e0b",
-  "#f97316",
-  "#a855f7",
-  "#e11d48",
-  "#6366f1",
-  "#14b8a6",
-];
+
+// /api/transactions caps pageSize to 100; keep this in sync so pagination
+// continues across all pages instead of stopping after the first response.
+const TRANSACTIONS_PAGE_SIZE = 100;
+const TRANSACTIONS_MAX_PAGES = 60;
+
+const fetchAllLoanTransactions = async (familyId: string) => {
+  const headers = await getClientAuthHeaders();
+  const allTransactions: LoanTxn[] = [];
+
+  for (let page = 1; page <= TRANSACTIONS_MAX_PAGES; page += 1) {
+    const payload = await fetchClientJson<LoanTransactionsPayload>(
+      `/api/transactions?familyId=${encodeURIComponent(familyId)}&page=${page}&pageSize=${TRANSACTIONS_PAGE_SIZE}`,
+      { method: "GET", headers }
+    );
+    const chunk = payload.transactions ?? [];
+    allTransactions.push(...chunk);
+    if (chunk.length < TRANSACTIONS_PAGE_SIZE) break;
+  }
+
+  return { transactions: allTransactions };
+};
 
 export default function LoansPage() {
   const { selectedFamily, selectedAccount, accounts } = useAppState();
@@ -76,6 +77,7 @@ export default function LoansPage() {
   const [activeLoanId, setActiveLoanId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [didInitAccountPreset, setDidInitAccountPreset] = useState(false);
   const [editingLoan, setEditingLoan] = useState<Loan | null>(null);
   const [editingLoanName, setEditingLoanName] = useState("");
@@ -117,13 +119,7 @@ export default function LoansPage() {
 
   const { data: txData, error: txError } = useSWR(
     selectedFamily ? `loan-transactions:${selectedFamily.id}` : null,
-    async () => {
-      const headers = await getClientAuthHeaders();
-      return fetchClientJson<LoanTransactionsPayload>(
-        `/api/transactions?familyId=${encodeURIComponent(selectedFamily!.id)}&page=1&pageSize=500`,
-        { method: "GET", headers }
-      );
-    },
+    async () => fetchAllLoanTransactions(selectedFamily!.id),
     { revalidateOnFocus: false, shouldRetryOnError: false }
   );
 
@@ -153,22 +149,6 @@ export default function LoansPage() {
     return loanTransactions.filter((transaction) => transaction.loan?.id === activeLoan.id);
   }, [loanTransactions, activeLoan]);
 
-  const activeRemainingChart = useMemo(() => {
-    if (!activeLoan) return [];
-    const paid = Math.max(0, activeLoan.total_amount - activeLoan.remaining_amount);
-    return [
-      {
-        metric: "Paid",
-        amount: paid,
-        color: "#16a34a",
-      },
-      {
-        metric: "Remaining",
-        amount: activeLoan.remaining_amount,
-        color: "#ef4444",
-      },
-    ];
-  }, [activeLoan]);
 
   const activeMonthlyPayments = useMemo(() => {
     const buckets = new Map<string, number>();
@@ -227,6 +207,7 @@ export default function LoansPage() {
       setName("");
       setTotalAmount("");
       setAccountId(accounts[0]?.id ?? "");
+      setIsCreateOpen(false);
       await mutate();
     } catch (createError) {
       setErrorMessage(createError instanceof Error ? createError.message : "Failed to create loan.");
@@ -278,12 +259,15 @@ export default function LoansPage() {
   };
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen app-shell">
       <AppNav />
-      <main className="mx-auto max-w-6xl space-y-6 px-4 py-8 lg:pl-64">
-        <div>
-          <p className="text-sm text-slate-500">Loans</p>
-          <h1 className="text-2xl font-semibold">{selectedFamily ? "Shared debt tracking" : "Select a family"}</h1>
+      <main className="app-main page-loans max-w-6xl space-y-8">
+        <div className="page-header">
+          <div>
+            <p className="page-kicker">Loans</p>
+            <h1 className="page-title">{selectedFamily ? "Debt, made visible" : "Select a family"}</h1>
+            <p className="page-subtitle">Follow the paydown story, monthly rhythm, and each member&apos;s contribution.</p>
+          </div>
         </div>
 
         {(error || errorMessage || txError) && (
@@ -300,7 +284,7 @@ export default function LoansPage() {
 
         {selectedFamily && (
           <>
-            <section className="grid gap-4 sm:grid-cols-3">
+            <section className="loan-summary grid gap-4 sm:grid-cols-3">
               <div className="card p-4">
                 <p className="text-sm text-slate-500">Total loan amount</p>
                 <p className="text-2xl font-semibold">{formatEur(loanSummary.total)}</p>
@@ -315,45 +299,11 @@ export default function LoansPage() {
               </div>
             </section>
 
-            {accounts.length > 0 ? (
-              <form onSubmit={createLoan} className="card space-y-3 p-4">
-                <h2 className="text-lg font-semibold">Create loan</h2>
-                <div className="grid gap-3 sm:grid-cols-3">
-                  <input
-                    className="input"
-                    placeholder="Loan name"
-                    value={name}
-                    onChange={(event) => setName(event.target.value)}
-                    required
-                  />
-                  <input
-                    className="input"
-                    type="number"
-                    step="0.01"
-                    placeholder="Total amount"
-                    value={totalAmount}
-                    onChange={(event) => setTotalAmount(event.target.value)}
-                    required
-                  />
-                  <PrettySelect
-                    value={accountId}
-                    onChange={setAccountId}
-                    options={accountOptions}
-                    placeholder="Choose account"
-                  />
-                </div>
-                <p className="text-xs text-slate-500">
-                  Payments are tracked through normal expense transactions using categories marked as loan-affecting.
-                </p>
-                <button className="btn btn-primary w-fit" type="submit" disabled={isSaving}>
-                  {isSaving ? "Saving..." : "Create"}
-                </button>
-              </form>
-            ) : (
+            {!accounts.length && (
               <div className="card p-4">Create a bank account first.</div>
             )}
 
-            <section className="space-y-3">
+            <section className="ledger-selector-list space-y-3">
               {isLoading && <div className="card p-4">Loading loans...</div>}
               {(data?.loans ?? []).map((loan) => {
                 const accountName = accounts.find((account) => account.id === loan.account_id)?.name ?? "Unlinked account";
@@ -418,63 +368,11 @@ export default function LoansPage() {
                 </div>
 
                 <section className="grid gap-4 lg:grid-cols-2">
-                  <div className="card min-w-0 space-y-2 p-4">
-                    <h3 className="text-lg font-semibold">Paid vs remaining</h3>
-                    <div className="h-64 min-w-0">
-                      <SafeResponsiveContainer minHeight={220}>
-                        <BarChart data={activeRemainingChart} margin={{ top: 8, right: 16, bottom: 8, left: 18 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                          <XAxis dataKey="metric" interval={0} minTickGap={18} tick={{ fontSize: 12 }} />
-                          <YAxis width={64} tickFormatter={(value) => formatEurAxis(Number(value ?? 0))} />
-                          <Tooltip formatter={(value) => formatEur(Number(value ?? 0))} />
-                          <Bar dataKey="amount" radius={[8, 8, 0, 0]} name="Amount">
-                            {activeRemainingChart.map((entry) => (
-                              <Cell key={`remaining-${entry.metric}`} fill={entry.color} />
-                            ))}
-                          </Bar>
-                        </BarChart>
-                      </SafeResponsiveContainer>
-                    </div>
-                  </div>
-
-                  <div className="card min-w-0 space-y-2 p-4">
-                    <h3 className="text-lg font-semibold">Payments by month</h3>
-                    <div className="h-64 min-w-0">
-                      <SafeResponsiveContainer minHeight={220}>
-                        <LineChart data={activeMonthlyPayments} margin={{ top: 8, right: 16, bottom: 8, left: 18 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                          <XAxis dataKey="month" tick={{ fontSize: 11 }} />
-                          <YAxis width={64} tickFormatter={(value) => formatEurAxis(Number(value ?? 0))} />
-                          <Tooltip formatter={(value) => formatEur(Number(value ?? 0))} />
-                          <Legend />
-                          <Line type="monotone" dataKey="amount" stroke="#0ea5e9" strokeWidth={2} dot={false} name="Paid" />
-                        </LineChart>
-                      </SafeResponsiveContainer>
-                    </div>
-                  </div>
+                  <LoanPaydownFigure total={activeLoan.total_amount} remaining={activeLoan.remaining_amount} />
+                  <LoanPaymentTimeline data={activeMonthlyPayments} />
                 </section>
 
-                <section className="card min-w-0 space-y-2 p-4">
-                  <h3 className="text-lg font-semibold">Payments by user</h3>
-                  <div className="h-64 min-w-0">
-                    <SafeResponsiveContainer minHeight={220}>
-                      <BarChart data={activePaymentByMember} margin={{ top: 8, right: 16, bottom: 8, left: 18 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                        <XAxis dataKey="member" interval={0} minTickGap={18} tick={{ fontSize: 11 }} />
-                        <YAxis width={64} tickFormatter={(value) => formatEurAxis(Number(value ?? 0))} />
-                        <Tooltip formatter={(value) => formatEur(Number(value ?? 0))} />
-                        <Bar dataKey="amount" radius={[8, 8, 0, 0]}>
-                          {activePaymentByMember.map((entry, index) => (
-                            <Cell
-                              key={`member-${entry.member}`}
-                              fill={USER_CHART_COLORS[index % USER_CHART_COLORS.length]}
-                            />
-                          ))}
-                        </Bar>
-                      </BarChart>
-                    </SafeResponsiveContainer>
-                  </div>
-                </section>
+                <LoanMemberFigure data={activePaymentByMember} />
 
                 <section className="space-y-3">
                   <h3 className="text-lg font-semibold">Past loan transactions</h3>
@@ -492,7 +390,12 @@ export default function LoansPage() {
                               {transaction.date ?? "No date"} · {transaction.member?.name ?? "Unassigned"}
                             </p>
                           </div>
-                          <p className="font-semibold text-red-600">-{formatEur(Number(transaction.amount ?? 0))}</p>
+                          <div className="sm:text-right">
+                            <p className="font-semibold text-red-600">-{formatEur(Number(transaction.amount ?? 0))}</p>
+                            <p className="text-xs text-slate-500">
+                              Saldo ap&oacute;s: {transaction.balance_after == null ? "-" : formatEur(transaction.balance_after)}
+                            </p>
+                          </div>
                         </li>
                       ))}
                     </ul>
@@ -503,6 +406,84 @@ export default function LoansPage() {
           </>
         )}
       </main>
+
+      {selectedFamily && accounts.length > 0 && (
+        <button
+          type="button"
+          className="fixed bottom-4 right-4 z-40 h-14 w-14 rounded-full bg-emerald-700 text-3xl leading-none text-white shadow-lg hover:bg-emerald-800 sm:bottom-6 sm:right-6 lg:right-8"
+          onClick={() => {
+            setErrorMessage(null);
+            setIsCreateOpen(true);
+          }}
+          aria-label="Create loan"
+        >
+          +
+        </button>
+      )}
+
+      <AppDialog
+        open={isCreateOpen}
+        onClose={() => {
+          setIsCreateOpen(false);
+          setErrorMessage(null);
+        }}
+        title="Create loan"
+        subtitle={selectedFamily?.name ?? "Loans"}
+      >
+        <form onSubmit={createLoan} className="space-y-4">
+          {errorMessage && <div className="status-banner status-banner-error">{errorMessage}</div>}
+          <label className="space-y-1">
+            <span className="label !mb-0">Loan name</span>
+            <input
+              className="input"
+              placeholder="e.g. Car loan"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+            />
+          </label>
+          <label className="space-y-1">
+            <span className="label !mb-0">Total amount</span>
+            <input
+              className="input"
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="0.00"
+              value={totalAmount}
+              onChange={(event) => setTotalAmount(event.target.value)}
+              required
+            />
+          </label>
+          <div className="space-y-1">
+            <span className="label !mb-0">Account</span>
+            <PrettySelect
+              value={accountId}
+              onChange={setAccountId}
+              options={accountOptions}
+              placeholder="Choose account"
+            />
+          </div>
+          <p className="text-xs text-slate-500">
+            Payments are tracked through normal expense transactions using categories marked as loan-affecting.
+          </p>
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end sm:gap-3">
+            <button
+              type="button"
+              className="btn btn-ghost border border-slate-200"
+              onClick={() => {
+                setIsCreateOpen(false);
+                setErrorMessage(null);
+              }}
+            >
+              Cancel
+            </button>
+            <button className="btn btn-primary" type="submit" disabled={isSaving}>
+              {isSaving ? "Saving..." : "Create loan"}
+            </button>
+          </div>
+        </form>
+      </AppDialog>
 
       <AppDialog
         open={Boolean(editingLoan)}

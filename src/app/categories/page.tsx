@@ -27,6 +27,7 @@ export default function CategoriesPage() {
   const [color, setColor] = useState("#0ea5e9");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [editingCategory, setEditingCategory] = useState<Category | null>(null);
   const [editingName, setEditingName] = useState("");
   const [editingType, setEditingType] = useState<CategoryType>("expense");
@@ -75,6 +76,7 @@ export default function CategoriesPage() {
       setAffectsLoan(false);
       setColor("#0ea5e9");
       await mutate();
+      setIsCreateOpen(false);
     } catch (createError) {
       setErrorMessage(createError instanceof Error ? createError.message : "Failed to create category.");
     } finally {
@@ -155,12 +157,28 @@ export default function CategoriesPage() {
   };
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen app-shell">
       <AppNav />
-      <main className="mx-auto max-w-5xl px-4 py-8 space-y-6 lg:pl-64">
-        <div>
-          <p className="text-sm text-slate-500">Categories</p>
-          <h1 className="text-2xl font-semibold">{selectedFamily ? "Manage categories" : "Select a family"}</h1>
+      <main className="app-main page-categories max-w-5xl space-y-8">
+        <div className="page-header">
+          <div>
+            <p className="page-kicker">Categories</p>
+            <h1 className="page-title">{selectedFamily ? "Organise your spending" : "Select a family"}</h1>
+            <p className="page-subtitle">Keep income and expenses clear with simple, consistent categories.</p>
+          </div>
+          {selectedFamily && (
+            <button
+              type="button"
+              className="btn btn-primary page-action"
+              onClick={() => {
+                setErrorMessage(null);
+                setIsCreateOpen(true);
+              }}
+            >
+              <span aria-hidden="true">+</span>
+              New category
+            </button>
+          )}
         </div>
 
         {(error || errorMessage) && (
@@ -181,40 +199,6 @@ export default function CategoriesPage() {
 
         {selectedFamily && (
           <>
-            <form onSubmit={createCategory} className="card p-4 space-y-3">
-              <h2 className="text-lg font-semibold">Create category</h2>
-              <div className="grid gap-3 sm:grid-cols-3">
-                <input
-                  className="input"
-                  placeholder="Name"
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  required
-                />
-                <PrettySelect
-                  value={type}
-                  onChange={(value) => setType(value as CategoryType)}
-                  options={typeOptions}
-                  placeholder="Type"
-                />
-                <label className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={affectsLoan}
-                    onChange={(event) => setAffectsLoan(event.target.checked)}
-                  />
-                  Affects loan
-                </label>
-                <label className="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm">
-                  <span>Color</span>
-                  <input type="color" value={color} onChange={(event) => setColor(event.target.value)} />
-                </label>
-              </div>
-              <button className="btn btn-primary w-fit" type="submit" disabled={isSaving}>
-                {isSaving ? "Saving..." : "Create"}
-              </button>
-            </form>
-
             <section className="card p-4 space-y-3">
               <h2 className="text-lg font-semibold">All categories</h2>
               {isLoading && <p className="text-sm text-slate-500">Loading categories...</p>}
@@ -223,17 +207,17 @@ export default function CategoriesPage() {
               )}
               <ul className="space-y-2">
                 {(data?.categories ?? []).map((category) => (
-                  <li key={category.id} className="rounded-lg border border-slate-200 p-3 flex items-center justify-between">
-                    <div>
+                  <li key={category.id} className="ledger-row flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0">
                       {(() => {
                         const categoryColor = resolveCategoryColor(category.color, category.name);
                         return (
-                          <p className="font-medium flex items-center gap-2">
+                          <p className="flex min-w-0 items-center gap-2 font-medium">
                             <span
                               className="inline-block h-3 w-3 rounded-full"
                               style={{ backgroundColor: categoryColor }}
                             />
-                            {category.name}
+                            <span className="truncate">{category.name}</span>
                           </p>
                         );
                       })()}
@@ -242,15 +226,18 @@ export default function CategoriesPage() {
                         {category.affects_loan ? " · affects loan" : ""}
                       </p>
                     </div>
-                    <div className="flex gap-2">
-                      <input
-                        type="color"
-                        title="Category color"
-                        value={resolveCategoryColor(category.color, category.name)}
-                        onChange={(event) => {
-                          void updateCategoryColor(category, event.target.value);
-                        }}
-                      />
+                    <div className="grid grid-cols-[minmax(96px,auto)_1fr_1fr] gap-2 sm:flex sm:items-center">
+                      <label className="btn btn-ghost px-3 text-xs">
+                        <span>Color</span>
+                        <input
+                          className="h-7 w-8"
+                          type="color"
+                          value={resolveCategoryColor(category.color, category.name)}
+                          onChange={(event) => {
+                            void updateCategoryColor(category, event.target.value);
+                          }}
+                        />
+                      </label>
                       <button
                         type="button"
                         className="btn btn-ghost text-xs"
@@ -279,6 +266,68 @@ export default function CategoriesPage() {
           </>
         )}
       </main>
+
+      <AppDialog
+        open={isCreateOpen}
+        onClose={() => {
+          setIsCreateOpen(false);
+          setErrorMessage(null);
+        }}
+        title="New category"
+        subtitle={selectedFamily?.name ?? "Categories"}
+      >
+        <form onSubmit={createCategory} className="space-y-4">
+          {errorMessage && <div className="status-banner status-banner-error">{errorMessage}</div>}
+          <label className="space-y-1">
+            <span className="label !mb-0">Name</span>
+            <input
+              className="input"
+              placeholder="e.g. Groceries"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+              autoFocus
+            />
+          </label>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="space-y-1">
+              <span className="label !mb-0">Type</span>
+              <PrettySelect
+                value={type}
+                onChange={(value) => setType(value as CategoryType)}
+                options={typeOptions}
+                placeholder="Type"
+              />
+            </label>
+            <label className="form-choice">
+              <input
+                type="checkbox"
+                checked={affectsLoan}
+                onChange={(event) => setAffectsLoan(event.target.checked)}
+              />
+              <span>
+                <strong>Affects loan</strong>
+                <small>Use this category in loan calculations.</small>
+              </span>
+            </label>
+          </div>
+          <label className="color-field">
+            <span>
+              <strong>Category colour</strong>
+              <small>Used in charts and activity lists.</small>
+            </span>
+            <input type="color" value={color} onChange={(event) => setColor(event.target.value)} />
+          </label>
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <button type="button" className="btn btn-ghost" onClick={() => setIsCreateOpen(false)}>
+              Cancel
+            </button>
+            <button className="btn btn-primary" type="submit" disabled={isSaving}>
+              {isSaving ? "Saving..." : "Create category"}
+            </button>
+          </div>
+        </form>
+      </AppDialog>
 
       <AppDialog
         open={Boolean(editingCategory)}
