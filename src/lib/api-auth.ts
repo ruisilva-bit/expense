@@ -1,8 +1,9 @@
 import type { User } from "@supabase/supabase-js";
+import { getAuthUserKindById, type FamilyMemberKind } from "@/lib/member-kind";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import { supabaseServer } from "@/lib/supabase-server";
 
-type FamilyMembershipRow = { id: string; role: "owner" | "member" | null };
+type FamilyMembershipRow = { id: string; role: "owner" | "member" | null; kind?: "human" | "system" | null };
 type AccountRow = { id: string; family_id: string; name: string; balance: number | string | null };
 type CategoryRow = { id: string; family_id: string; name: string; type: string | null; affects_loan: boolean | null };
 type AccountMemberRoleRow = { account_id: string; user_id: string | null; role: "owner" | "member" | null };
@@ -12,6 +13,11 @@ type LoanRow = {
   name: string | null;
   remaining_amount: number | string | null;
   total_amount: number | string | null;
+};
+type VerifiedAccountAccessContext = {
+  membership?: FamilyMembershipRow | null;
+  authUserKind?: FamilyMemberKind | null;
+  familyAccountIds?: string[] | null;
 };
 
 const isMissingAccountsTable = (message: string) => {
@@ -59,7 +65,7 @@ export async function getFamilyMembership(familyId: string, userId: string) {
   const admin = supabaseAdmin();
   const res = await admin
     .from("family_members")
-    .select("id,role")
+    .select("id,role,kind")
     .eq("family_id", familyId)
     .eq("user_id", userId)
     .maybeSingle();
@@ -188,16 +194,43 @@ export async function getAccountVisibilityMap(accountIds: string[]) {
   };
 }
 
-export async function getAccessibleAccountIds(familyId: string, userId: string) {
-  const admin = supabaseAdmin();
-  const accountsRes = await admin.from("bank_accounts").select("id").eq("family_id", familyId);
-  if (accountsRes.error) {
-    return { accountIds: null, error: accountsRes.error.message };
+export async function getAccessibleAccountIds(
+  familyId: string,
+  userId: string,
+  verifiedContext?: VerifiedAccountAccessContext
+) {
+  const membership = verifiedContext?.membership
+    ? { data: verifiedContext.membership, error: null }
+    : await getFamilyMembership(familyId, userId);
+
+  if (membership.error) {
+    return { accountIds: null, error: membership.error };
+  }
+  if (!membership.data) {
+    return { accountIds: [] as string[], error: null };
+  }
+  const verifiedMembership = membership.data;
+
+  let accountIds = verifiedContext?.familyAccountIds
+    ? Array.from(new Set(verifiedContext.familyAccountIds.filter(Boolean)))
+    : null;
+
+  if (!accountIds) {
+    const admin = supabaseAdmin();
+    const accountsRes = await admin.from("bank_accounts").select("id").eq("family_id", familyId);
+    if (accountsRes.error) {
+      return { accountIds: null, error: accountsRes.error.message };
+    }
+    accountIds = (accountsRes.data ?? []).map((account) => account.id as string).filter(Boolean);
   }
 
-  const accountIds = (accountsRes.data ?? []).map((account) => account.id as string).filter(Boolean);
   if (!accountIds.length) {
     return { accountIds: [] as string[], error: null };
+  }
+  const membershipKind = verifiedMembership.kind === "system" ? "system" : "human";
+  const authUserKind = verifiedContext?.authUserKind ?? await getAuthUserKindById(userId);
+  if (membershipKind === "system" || authUserKind === "system") {
+    return { accountIds, error: null };
   }
 
   const visibility = await getAccountVisibilityMap(accountIds);
@@ -229,6 +262,22 @@ export async function ensureAccountAccess(familyId: string, userId: string, acco
 }
 
 export async function ensureAccountOwner(familyId: string, userId: string, accountId: string) {
+  const familyMembership = await getFamilyMembership(familyId, userId);
+  if (familyMembership.error) {
+    return { ok: false as const, status: 400, error: familyMembership.error };
+  }
+  if (!familyMembership.data) {
+    return { ok: false as const, status: 403, error: "Forbidden" };
+  }
+  const membershipKind = familyMembership.data.kind === "system" ? "system" : "human";
+  const authUserKind = await getAuthUserKindById(userId);
+  if (membershipKind === "system" || authUserKind === "system") {
+    if (familyMembership.data.role === "owner") {
+      return { ok: true as const };
+    }
+    return { ok: false as const, status: 403, error: "Only account owners can change account visibility." };
+  }
+
   const memberships = await getAccountMembershipMap([accountId]);
   if (memberships.error) {
     return { ok: false as const, status: 400, error: memberships.error };

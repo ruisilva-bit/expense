@@ -32,6 +32,23 @@ type RecurringPayload = {
   members: Member[];
   accounts: Account[];
   categories: Category[];
+  reconciliation?: {
+    inserted_occurrences: number;
+    updated_schedules: number;
+    removed_duplicates: number;
+    fixed_duplicate_groups: number;
+    errors: string[];
+  };
+};
+
+type RecalculateResponse = {
+  success: boolean;
+  processed_recurring: number;
+  inserted_occurrences: number;
+  updated_schedules: number;
+  removed_duplicates: number;
+  fixed_duplicate_groups: number;
+  errors: string[];
 };
 
 type FrequencyUnit = "day" | "week" | "month" | "year";
@@ -74,6 +91,7 @@ export default function RecurringPage() {
   const [description, setDescription] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [editingRecurring, setEditingRecurring] = useState<RecurringRow | null>(null);
   const [editingAmount, setEditingAmount] = useState("");
   const [editingInterval, setEditingInterval] = useState("1");
@@ -82,6 +100,8 @@ export default function RecurringPage() {
   const [editingDescription, setEditingDescription] = useState("");
   const [deletingRecurringId, setDeletingRecurringId] = useState<string | null>(null);
   const [didInitAccountPreset, setDidInitAccountPreset] = useState(false);
+  const [isRecalculating, setIsRecalculating] = useState(false);
+  const [recalculateMessage, setRecalculateMessage] = useState<string | null>(null);
 
   const { data, error, mutate, isLoading } = useSWR(
     selectedFamily ? `recurring:${selectedFamily.id}` : null,
@@ -218,6 +238,7 @@ export default function RecurringPage() {
       setEveryInterval("1");
       setEveryUnit("month");
       await mutate();
+      setIsCreateOpen(false);
     } catch (createError) {
       setErrorMessage(createError instanceof Error ? createError.message : "Failed to create recurring transaction.");
     } finally {
@@ -272,13 +293,58 @@ export default function RecurringPage() {
     }
   };
 
+  const recalculateRecurring = async () => {
+    if (!selectedFamily) return;
+    setErrorMessage(null);
+    setRecalculateMessage(null);
+    setIsRecalculating(true);
+    try {
+      const headers = await getClientAuthHeaders();
+      const result = await fetchClientJson<RecalculateResponse>("/api/recurring-transactions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify({ familyId: selectedFamily.id, action: "recalculate" }),
+      });
+
+      const issues = result.errors?.length ?? 0;
+      const summary = `Recalculated ${result.inserted_occurrences} missing expense${result.inserted_occurrences === 1 ? "" : "s"}, updated ${result.updated_schedules} schedule${result.updated_schedules === 1 ? "" : "s"}, and removed ${result.removed_duplicates} duplicate${result.removed_duplicates === 1 ? "" : "s"}.`;
+      const suffix = issues ? ` (${issues} item${issues === 1 ? "" : "s"} with warnings)` : "";
+      setRecalculateMessage(`${summary}${suffix}`);
+      await mutate();
+    } catch (recalcError) {
+      setErrorMessage(recalcError instanceof Error ? recalcError.message : "Failed to recalculate recurring expenses.");
+    } finally {
+      setIsRecalculating(false);
+    }
+  };
+
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen app-shell">
       <AppNav />
-      <main className="mx-auto max-w-5xl px-4 py-8 space-y-6 lg:pl-64">
-        <div>
-          <p className="text-sm text-slate-500">Recurring</p>
-          <h1 className="text-2xl font-semibold">{selectedFamily ? "Recurring expenses" : "Select a family"}</h1>
+      <main className="app-main page-recurring max-w-5xl space-y-8">
+        <div className="page-header">
+          <div>
+            <p className="page-kicker">Recurring</p>
+            <h1 className="page-title">{selectedFamily ? "Recurring expenses" : "Select a family"}</h1>
+            <p className="page-subtitle">Review upcoming household costs and keep every schedule under control.</p>
+          </div>
+          {selectedFamily && (
+            <button
+              type="button"
+              className="btn btn-primary page-action"
+              disabled={!accountOptions.length}
+              onClick={() => {
+                setErrorMessage(null);
+                setIsCreateOpen(true);
+              }}
+            >
+              <span aria-hidden="true">+</span>
+              New recurring expense
+            </button>
+          )}
         </div>
 
         {(error || errorMessage) && (
@@ -292,8 +358,18 @@ export default function RecurringPage() {
         {selectedFamily && (
           <>
             {accountOptions.length > 0 ? (
-              <form onSubmit={createRecurring} className="card p-4 space-y-3">
-                <h2 className="text-lg font-semibold">Create recurring transaction</h2>
+              <AppDialog
+                open={isCreateOpen}
+                onClose={() => {
+                  setIsCreateOpen(false);
+                  setErrorMessage(null);
+                }}
+                title="New recurring expense"
+                subtitle={selectedFamily.name}
+                maxWidthClassName="max-w-4xl"
+              >
+              <form onSubmit={createRecurring} className="space-y-4">
+                {errorMessage && <div className="status-banner status-banner-error">{errorMessage}</div>}
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                   <PrettySelect value={accountId} onChange={setAccountId} options={accountSelectOptions} placeholder="Choose account" />
                   <PrettySelect value={categoryId} onChange={setCategoryId} options={categorySelectOptions} placeholder="No category" />
@@ -306,13 +382,16 @@ export default function RecurringPage() {
                     onChange={(event) => setAmount(event.target.value)}
                     required
                   />
-                  <input
-                    className="input"
-                    type="date"
-                    value={nextDate}
-                    onChange={(event) => setNextDate(event.target.value)}
-                    required
-                  />
+                  <label className="space-y-1">
+                    <span className="label !mb-0">Next date</span>
+                    <input
+                      className="input"
+                      type="date"
+                      value={nextDate}
+                      onChange={(event) => setNextDate(event.target.value)}
+                      required
+                    />
+                  </label>
                 </div>
 
                 <div className="grid gap-3 lg:grid-cols-[minmax(280px,1fr)_minmax(300px,1fr)]">
@@ -377,6 +456,7 @@ export default function RecurringPage() {
                       className="input w-24"
                       type="number"
                       min="1"
+                      aria-label="Repeat interval"
                       value={everyInterval}
                       onChange={(event) => setEveryInterval(event.target.value)}
                       required
@@ -401,22 +481,57 @@ export default function RecurringPage() {
                   value={description}
                   onChange={(event) => setDescription(event.target.value)}
                 />
-                <button
-                  className="btn btn-primary w-fit"
-                  type="submit"
-                  disabled={isSaving || !selectableRecurringMembers.length}
-                >
-                  {isSaving ? "Saving..." : "Create"}
-                </button>
+                <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                  <button type="button" className="btn btn-ghost" onClick={() => setIsCreateOpen(false)}>
+                    Cancel
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    type="submit"
+                    disabled={isSaving || !selectableRecurringMembers.length}
+                  >
+                    {isSaving ? "Saving..." : "Create recurring expense"}
+                  </button>
+                </div>
               </form>
+              </AppDialog>
             ) : (
               <div className="card p-4 text-sm text-slate-600">
                 You do not have access to any bank account in this family yet.
               </div>
             )}
 
-            <section className="card p-4 space-y-3">
-              <h2 className="text-lg font-semibold">Scheduled</h2>
+            <section className="card schedule-ledger p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-lg font-semibold">Scheduled</h2>
+                <button
+                  type="button"
+                  className="btn btn-ghost border border-slate-200 text-xs"
+                  onClick={() => void recalculateRecurring()}
+                  disabled={isRecalculating || isLoading}
+                >
+                  {isRecalculating ? "Recalculating..." : "Recalculate now"}
+                </button>
+              </div>
+              {recalculateMessage && <p className="text-xs text-emerald-700">{recalculateMessage}</p>}
+              {(data?.reconciliation?.inserted_occurrences ?? 0) > 0 && !recalculateMessage && (
+                <p className="text-xs text-emerald-700">
+                  Auto-recalculated {data?.reconciliation?.inserted_occurrences} missing expense
+                  {(data?.reconciliation?.inserted_occurrences ?? 0) === 1 ? "" : "s"} after downtime.
+                </p>
+              )}
+              {(data?.reconciliation?.removed_duplicates ?? 0) > 0 && !recalculateMessage && (
+                <p className="text-xs text-emerald-700">
+                  Removed {data?.reconciliation?.removed_duplicates} duplicate recurring expense
+                  {(data?.reconciliation?.removed_duplicates ?? 0) === 1 ? "" : "s"} automatically.
+                </p>
+              )}
+              {(data?.reconciliation?.errors?.length ?? 0) > 0 && (
+                <p className="text-xs text-amber-700">
+                  {data?.reconciliation?.errors.length} recurring item
+                  {(data?.reconciliation?.errors.length ?? 0) === 1 ? "" : "s"} could not be fully reconciled.
+                </p>
+              )}
               {isLoading && <p className="text-sm text-slate-500">Loading recurring transactions...</p>}
               {!isLoading && !(data?.recurring ?? []).length && (
                 <p className="text-sm text-slate-500">No recurring transactions yet.</p>

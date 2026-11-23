@@ -18,7 +18,24 @@ import {
   stripMemberTag,
   withMemberIdsTag,
 } from "@/lib/member-tags";
+import {
+  extractGoalMove,
+  extractGoalTag,
+  stripGoalTags,
+  type GoalMoveType,
+  withGoalMoveTags,
+} from "@/lib/goal-moves";
 import { supabaseAdmin } from "@/lib/supabase-admin";
+import {
+  BALANCE_TIMELINE_REUSE_LIMIT,
+  buildBalanceAfterMapFromRows,
+  buildTransferLookupMap,
+  collectTransferIds,
+  inferTransferSideFromDescription,
+  transferSideFromType,
+  type BalanceTimelineRow,
+  type TransferLookupRow,
+} from "@/lib/transaction-balance";
 
 type TxnType = "income" | "expense" | "transfer";
 
@@ -56,8 +73,14 @@ type LoanQueryResult = {
   data: Array<{ id: string; name: string | null; remaining_amount?: number | string | null; account_id?: string | null; bank_account_id?: string | null }> | null;
   error: QueryError;
 };
-type TransferLookupRow = { id: string; source_account_id: string; dest_account_id: string };
 type MemberRow = { id: string; name: string | null; user_id?: string | null };
+type GoalRow = {
+  id: string;
+  name: string | null;
+  current_amount: number | string | null;
+  bank_account_id?: string | null;
+  account_id?: string | null;
+};
 
 const isMissingColorColumnError = (message: string) => {
   const lower = message.toLowerCase();
@@ -97,6 +120,14 @@ const accountImpact = (type: TxnType, amount: number) => {
   return 0;
 };
 
+const goalMovementAccountImpact = (moveType: GoalMoveType, amount: number) => {
+  return moveType === "release" ? amount : -amount;
+};
+
+const goalMovementReserveDelta = (moveType: GoalMoveType, oldAmount: number, nextAmount: number) => {
+  return moveType === "allocate" ? nextAmount - oldAmount : oldAmount - nextAmount;
+};
+
 const extractLoanId = (description: string | null | undefined) => {
   if (!description) return null;
   const match = description.match(LOAN_TAG_REGEX);
@@ -130,7 +161,7 @@ const stripRecurringTag = (description: string | null | undefined) => {
 };
 
 const stripSystemTags = (description: string | null | undefined) =>
-  stripMemberTag(stripLoanTag(stripTransferTag(stripRecurringTag(description))));
+  stripMemberTag(stripLoanTag(stripTransferTag(stripRecurringTag(stripGoalTags(description)))));
 
 const withLoanTag = (description: string | null, loanId: string | null) => {
   const base = stripLoanTag(description);
@@ -144,31 +175,66 @@ const withTransferTag = (description: string | null, transferId: string, side?: 
   return base ? `${base} ${tag}` : tag;
 };
 
-const inferTransferSideFromDescription = (description: string | null | undefined) => {
-  if (!description) return null;
-  const lower = description.toLowerCase();
-  if (lower.includes("transfer to")) return "source" as const;
-  if (lower.includes("transfer from")) return "dest" as const;
-  return null;
-};
+async function computeBalanceAfterMap(input: {
+  familyId: string;
+  accountCurrentBalance: Map<string, number>;
+  accountIds: string[];
+  sinceDate?: string | null;
+}) {
+  const { familyId, accountCurrentBalance, accountIds, sinceDate } = input;
+  const map = new Map<string, number>();
+  if (!accountIds.length) return map;
 
-const transferSideFromType = (value: string | null | undefined) => {
-  const kind = (value ?? "").toLowerCase();
-  if (kind === "transfer_in") return "dest" as const;
-  if (kind === "transfer_out") return "source" as const;
-  return null;
-};
+  const admin = supabaseAdmin();
+  let timelineQuery = admin
+    .from("transactions")
+    .select("id,bank_account_id,amount,type,description,date,created_at")
+    .eq("family_id", familyId)
+    .in("bank_account_id", accountIds);
+
+  if (sinceDate) timelineQuery = timelineQuery.gte("date", sinceDate);
+
+  const timelineRes = await timelineQuery
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  if (timelineRes.error) return map;
+
+  const timelineRows = (timelineRes.data ?? []) as BalanceTimelineRow[];
+  const transferIds = collectTransferIds(timelineRows);
+
+  let transferById = new Map<string, { sourceAccountId: string; destAccountId: string }>();
+  if (transferIds.length) {
+    const transferRes = await admin
+      .from("transfers")
+      .select("id,source_account_id,dest_account_id")
+      .in("id", transferIds);
+    if (!transferRes.error) {
+      transferById = buildTransferLookupMap((transferRes.data ?? []) as TransferLookupRow[]);
+    }
+  }
+
+  return buildBalanceAfterMapFromRows({
+    accountCurrentBalance,
+    accountIds,
+    rows: timelineRows,
+    transferById,
+  });
+}
 
 async function ensureAssignedMember(familyId: string, memberId: string) {
   const admin = supabaseAdmin();
   const memberRes = await admin
     .from("family_members")
-    .select("id")
+    .select("id,kind")
     .eq("id", memberId)
     .eq("family_id", familyId)
     .maybeSingle();
   if (memberRes.error) return { ok: false as const, error: memberRes.error.message };
   if (!memberRes.data) return { ok: false as const, error: "Assigned member does not belong to this family." };
+  if ((memberRes.data.kind ?? "human") === "system") {
+    return { ok: false as const, error: "System API users cannot be assigned to expenses or income entries." };
+  }
   return { ok: true as const };
 }
 
@@ -207,6 +273,30 @@ async function applyLoanRemainingDelta(loanId: string, delta: number) {
   }
 
   return { ok: true as const };
+}
+
+async function getGoal(goalId: string) {
+  const admin = supabaseAdmin();
+  const goal = await admin.from("goals").select("id,name,current_amount,bank_account_id,account_id").eq("id", goalId).maybeSingle();
+  if (goal.error) return { data: null, error: goal.error.message };
+  return { data: (goal.data as GoalRow | null) ?? null, error: null };
+}
+
+async function updateGoalRecord(goalId: string, payload: Record<string, unknown>) {
+  const admin = supabaseAdmin();
+  let update = await admin.from("goals").update(payload).eq("id", goalId).select("id,name,current_amount,bank_account_id,account_id").single();
+  if (update.error && payload.bank_account_id) {
+    const fallbackPayload: Record<string, unknown> = {};
+    Object.entries(payload).forEach(([key, value]) => {
+      if (key !== "bank_account_id") fallbackPayload[key] = value;
+    });
+    fallbackPayload.account_id = payload.bank_account_id;
+    update = await admin.from("goals").update(fallbackPayload).eq("id", goalId).select("id,name,current_amount,bank_account_id,account_id").single();
+  }
+  if (update.error || !update.data) {
+    return { data: null, error: update.error?.message ?? "Failed to update goal." };
+  }
+  return { data: update.data as GoalRow, error: null };
 }
 
 async function getTransfer(transferId: string) {
@@ -283,7 +373,7 @@ export async function GET(request: NextRequest) {
   const dateFrom = request.nextUrl.searchParams.get("dateFrom");
   const dateTo = request.nextUrl.searchParams.get("dateTo");
 
-  const access = await getAccessibleAccountIds(familyId, user.id);
+  const access = await getAccessibleAccountIds(familyId, user.id, { membership: membership.membership });
   if (access.error || !access.accountIds) {
     return NextResponse.json({ error: access.error ?? "Failed to load account access." }, { status: 400 });
   }
@@ -320,12 +410,7 @@ export async function GET(request: NextRequest) {
   if (!memberIds.length) {
     query = query.range(from, to);
   } else {
-    query = query.limit(1000);
-  }
-
-  const txRes = await query;
-  if (txRes.error) {
-    return NextResponse.json({ error: txRes.error.message }, { status: 400 });
+    query = query.limit(BALANCE_TIMELINE_REUSE_LIMIT);
   }
 
   const loansPromise = (async () => {
@@ -346,24 +431,36 @@ export async function GET(request: NextRequest) {
     return { includeBankAccountId, loansRes };
   })();
 
-  const [accountsRes, membersRes, loansBundle] = await Promise.all([
-    admin.from("bank_accounts").select("id,name").eq("family_id", familyId).in("id", accessibleAccountIds),
-    admin.from("family_members").select("id,name,user_id").eq("family_id", familyId),
+  const categoriesPromise = (async () => {
+    let categoriesRes = (await admin
+      .from("categories")
+      .select("id,name,type,affects_loan,color")
+      .eq("family_id", familyId)) as CategoryQueryResult;
+    let includeColor = true;
+    if (categoriesRes.error && isMissingColorColumnError(categoriesRes.error.message)) {
+      includeColor = false;
+      categoriesRes = (await admin
+        .from("categories")
+        .select("id,name,type,affects_loan")
+        .eq("family_id", familyId)) as CategoryQueryResult;
+    }
+
+    return { categoriesRes, includeColor };
+  })();
+
+  const [txRes, accountsRes, membersRes, loansBundle, categoriesBundle] = await Promise.all([
+    query,
+    admin.from("bank_accounts").select("id,name,balance").eq("family_id", familyId).in("id", accessibleAccountIds),
+    admin.from("family_members").select("id,name,user_id").eq("family_id", familyId).neq("kind", "system"),
     loansPromise,
+    categoriesPromise,
   ]);
 
-  let categoriesRes = (await admin
-    .from("categories")
-    .select("id,name,type,affects_loan,color")
-    .eq("family_id", familyId)) as CategoryQueryResult;
-  let includeColor = true;
-  if (categoriesRes.error && isMissingColorColumnError(categoriesRes.error.message)) {
-    includeColor = false;
-    categoriesRes = (await admin
-      .from("categories")
-      .select("id,name,type,affects_loan")
-      .eq("family_id", familyId)) as CategoryQueryResult;
+  if (txRes.error) {
+    return NextResponse.json({ error: txRes.error.message }, { status: 400 });
   }
+
+  const { categoriesRes, includeColor } = categoriesBundle;
 
   if (accountsRes.error) return NextResponse.json({ error: accountsRes.error.message }, { status: 400 });
   if (categoriesRes.error) return NextResponse.json({ error: categoriesRes.error.message }, { status: 400 });
@@ -428,17 +525,7 @@ export async function GET(request: NextRequest) {
   const rawTransactions = memberIds.length
     ? memberFilteredTransactions.slice(from, to + 1)
     : memberFilteredTransactions;
-  const transferIds = Array.from(
-    new Set(
-      rawTransactions
-        .filter((txn) => {
-          const kind = (txn.type ?? "").toLowerCase();
-          return kind === "transfer" || kind === "transfer_in" || kind === "transfer_out";
-        })
-        .map((txn) => extractTransferTag(txn.description)?.id ?? null)
-        .filter((id): id is string => Boolean(id))
-    )
-  );
+  const transferIds = collectTransferIds(rawTransactions);
 
   let transferById = new Map<string, { sourceAccountId: string; destAccountId: string }>();
   if (transferIds.length) {
@@ -449,19 +536,12 @@ export async function GET(request: NextRequest) {
     if (transferRes.error) {
       return NextResponse.json({ error: transferRes.error.message }, { status: 400 });
     }
-    transferById = new Map(
-      ((transferRes.data ?? []) as TransferLookupRow[]).map((transfer) => [
-        transfer.id,
-        {
-          sourceAccountId: transfer.source_account_id,
-          destAccountId: transfer.dest_account_id,
-        },
-      ])
-    );
+    transferById = buildTransferLookupMap((transferRes.data ?? []) as TransferLookupRow[]);
   }
 
   const transactions = rawTransactions.map((txn) => {
-    const normalizedType = normalizeType(txn.type);
+    const goalMove = extractGoalMove(txn.description);
+    const normalizedType = goalMove && goalMove.moveType !== "spend" ? "transfer" : normalizeType(txn.type);
     const category = txn.category_id ? categoryById.get(txn.category_id) : null;
     const linkedLoanId = extractLoanId(txn.description);
     const transferTag = extractTransferTag(txn.description);
@@ -486,6 +566,14 @@ export async function GET(request: NextRequest) {
         : memberNameList.length === 1
           ? memberNameList[0]
           : "Unassigned";
+    const goalCategoryName =
+      goalMove?.moveType === "allocate"
+        ? "Reserva para goal"
+        : goalMove?.moveType === "release"
+          ? "Libertar do goal"
+          : goalMove?.moveType === "spend"
+            ? category?.name ?? "Despesa do goal"
+            : category?.name ?? null;
     return {
       ...txn,
       type: normalizedType,
@@ -493,14 +581,16 @@ export async function GET(request: NextRequest) {
       member_ids: transactionMemberIds,
       member_label: memberLabel,
       amount: asNumber(txn.amount),
-      transfer_side: transferSide,
-      category: category
+      transfer_side: goalMove && goalMove.moveType !== "spend" ? null : transferSide,
+      goal_move_type: goalMove?.moveType ?? null,
+      goal_id: extractGoalTag(txn.description),
+      category: goalCategoryName || category
         ? {
-            id: category.id,
-            name: category.name,
-            type: category.type,
-            affects_loan: Boolean(category.affects_loan),
-            color: includeColor ? (category as { color?: string | null }).color ?? null : null,
+            id: category?.id ?? null,
+            name: goalCategoryName ?? category?.name,
+            type: category?.type ?? normalizedType,
+            affects_loan: Boolean(category?.affects_loan),
+            color: includeColor ? (category as { color?: string | null } | null)?.color ?? null : null,
           }
         : null,
       bank_account: { id: txn.bank_account_id, name: accountById.get(txn.bank_account_id) ?? "Account" },
@@ -514,8 +604,31 @@ export async function GET(request: NextRequest) {
     };
   });
 
+  const oldestVisibleTxnDate = transactions.reduce<string | null>((oldest, transaction) => {
+    if (!transaction.date) return oldest;
+    if (!oldest) return transaction.date;
+    return transaction.date < oldest ? transaction.date : oldest;
+  }, null);
+  const accountCurrentBalance = new Map(
+    ((accountsRes.data ?? []) as Array<{ id: string; balance: number | string | null }>).map((account) => [
+      account.id,
+      asNumber(account.balance),
+    ])
+  );
+  const balanceAfterById = await computeBalanceAfterMap({
+    familyId,
+    accountCurrentBalance,
+    accountIds: Array.from(new Set(transactions.map((txn) => txn.bank_account_id).filter(Boolean))),
+    sinceDate: oldestVisibleTxnDate,
+  });
+
+  const transactionsWithBalance = transactions.map((transaction) => ({
+    ...transaction,
+    balance_after: balanceAfterById.get(transaction.id) ?? null,
+  }));
+
   return NextResponse.json({
-    transactions,
+    transactions: transactionsWithBalance,
     page,
     pageSize,
     members: familyMembers.map((member) => ({ id: member.id, name: member.name ?? "Member" })),
@@ -831,6 +944,7 @@ export async function PATCH(request: Request) {
     return NextResponse.json({ error: existingRes.error?.message ?? "Transaction not found." }, { status: 404 });
   }
   const existing = existingRes.data as TransactionRow;
+  const existingGoalMove = extractGoalMove(existing.description);
 
   const membership = await ensureFamilyMember(existing.family_id, user.id);
   if (!membership.ok) {
@@ -844,6 +958,110 @@ export async function PATCH(request: Request) {
   const accessibleSet = new Set(access.accountIds);
   if (!accessibleSet.has(existing.bank_account_id)) {
     return NextResponse.json({ error: "You do not have access to this account." }, { status: 403 });
+  }
+
+  if (existingGoalMove) {
+    if (existingGoalMove.moveType === "spend") {
+      return NextResponse.json(
+        { error: "Goal spend movements are not editable from Activity yet." },
+        { status: 400 }
+      );
+    }
+
+    const goalRes = await getGoal(existingGoalMove.goalId);
+    if (goalRes.error || !goalRes.data) {
+      return NextResponse.json({ error: goalRes.error ?? "Goal not found." }, { status: 404 });
+    }
+
+    const nextAmount = payload.amount !== undefined ? Math.abs(asNumber(payload.amount)) : asNumber(existing.amount);
+    if (!nextAmount) {
+      return NextResponse.json({ error: "Amount is required." }, { status: 400 });
+    }
+
+    const nextBankAccountId = (payload.bank_account_id ?? existing.bank_account_id).trim();
+    if (!nextBankAccountId) {
+      return NextResponse.json({ error: "Bank account is required." }, { status: 400 });
+    }
+
+    const nextAccount = await getAccount(nextBankAccountId);
+    if (nextAccount.error || !nextAccount.data) {
+      return NextResponse.json({ error: nextAccount.error ?? "Bank account not found." }, { status: 404 });
+    }
+    if (nextAccount.data.family_id !== existing.family_id) {
+      return NextResponse.json({ error: "Bank account does not belong to this family." }, { status: 400 });
+    }
+    if (!accessibleSet.has(nextBankAccountId)) {
+      return NextResponse.json({ error: "You do not have access to this account." }, { status: 403 });
+    }
+
+    const legacyAccount = await ensureLegacyAccountForBankAccount(nextBankAccountId);
+    if (!legacyAccount.ok) {
+      return NextResponse.json({ error: legacyAccount.error }, { status: 400 });
+    }
+
+    const currentGoalAmount = asNumber(goalRes.data.current_amount);
+    const reserveDelta = goalMovementReserveDelta(
+      existingGoalMove.moveType,
+      asNumber(existing.amount),
+      nextAmount
+    );
+    const nextGoalCurrent = currentGoalAmount + reserveDelta;
+    if (nextGoalCurrent < 0) {
+      return NextResponse.json({ error: "O goal não tem saldo suficiente para essa alteração." }, { status: 400 });
+    }
+
+    const goalName = goalRes.data.name?.trim() || "Goal";
+    const fallbackDescription =
+      existingGoalMove.moveType === "allocate"
+        ? `Transferência para goal: ${goalName}`
+        : `Transferência do goal: ${goalName}`;
+    const visibleDescription =
+      payload.description !== undefined ? payload.description?.trim() || null : stripSystemTags(existing.description);
+    const nextDate = payload.date !== undefined ? payload.date.slice(0, 10) : existing.date ?? todayIsoDate();
+    const nextDescription = withGoalMoveTags(
+      visibleDescription || fallbackDescription,
+      existingGoalMove.goalId,
+      existingGoalMove.moveType
+    );
+
+    const update = await admin
+      .from("transactions")
+      .update({
+        bank_account_id: nextBankAccountId,
+        account_id: nextBankAccountId,
+        amount: nextAmount,
+        description: nextDescription,
+        date: nextDate,
+      })
+      .eq("id", transactionId)
+      .select("id,family_id,bank_account_id,assigned_to,amount,type,category_id,description,date,created_at")
+      .single();
+
+    if (update.error || !update.data) {
+      return NextResponse.json({ error: update.error?.message ?? "Failed to update goal movement." }, { status: 400 });
+    }
+
+    const oldImpact = goalMovementAccountImpact(existingGoalMove.moveType, asNumber(existing.amount));
+    const newImpact = goalMovementAccountImpact(existingGoalMove.moveType, nextAmount);
+    if (existing.bank_account_id === nextBankAccountId) {
+      const balanceUpdate = await applyBalanceDelta(existing.bank_account_id, -oldImpact + newImpact);
+      if (!balanceUpdate.ok) return NextResponse.json({ error: balanceUpdate.error }, { status: 400 });
+    } else {
+      const sourceUpdate = await applyBalanceDelta(existing.bank_account_id, -oldImpact);
+      if (!sourceUpdate.ok) return NextResponse.json({ error: sourceUpdate.error }, { status: 400 });
+      const targetUpdate = await applyBalanceDelta(nextBankAccountId, newImpact);
+      if (!targetUpdate.ok) return NextResponse.json({ error: targetUpdate.error }, { status: 400 });
+    }
+
+    const goalUpdate = await updateGoalRecord(existingGoalMove.goalId, {
+      current_amount: nextGoalCurrent,
+      bank_account_id: nextBankAccountId,
+    });
+    if (goalUpdate.error) {
+      return NextResponse.json({ error: goalUpdate.error }, { status: 400 });
+    }
+
+    return NextResponse.json({ transaction: update.data });
   }
 
   const nextType = payload.type ? normalizeType(payload.type) : normalizeType(existing.type);
@@ -1280,6 +1498,8 @@ export async function DELETE(request: Request) {
     return NextResponse.json({ error: existingRes.error?.message ?? "Transaction not found." }, { status: 404 });
   }
 
+  const existingGoalMove = extractGoalMove(existingRes.data.description as string | null | undefined);
+
   const membership = await ensureFamilyMember(existingRes.data.family_id as string, user.id);
   if (!membership.ok) {
     return NextResponse.json({ error: membership.error }, { status: membership.status });
@@ -1291,6 +1511,47 @@ export async function DELETE(request: Request) {
   }
   if (!access.accountIds.includes(existingRes.data.bank_account_id as string)) {
     return NextResponse.json({ error: "You do not have access to this account." }, { status: 403 });
+  }
+
+  if (existingGoalMove) {
+    if (existingGoalMove.moveType === "spend") {
+      return NextResponse.json(
+        { error: "Goal spend movements are not deletable from Activity yet." },
+        { status: 400 }
+      );
+    }
+
+    const goalRes = await getGoal(existingGoalMove.goalId);
+    if (goalRes.error || !goalRes.data) {
+      return NextResponse.json({ error: goalRes.error ?? "Goal not found." }, { status: 404 });
+    }
+
+    const amount = asNumber(existingRes.data.amount);
+    const currentGoalAmount = asNumber(goalRes.data.current_amount);
+    const nextGoalCurrent = currentGoalAmount + goalMovementReserveDelta(existingGoalMove.moveType, amount, 0);
+    if (nextGoalCurrent < 0) {
+      return NextResponse.json({ error: "O goal não tem saldo suficiente para apagar este movimento." }, { status: 400 });
+    }
+
+    const del = await admin.from("transactions").delete().eq("id", transactionId);
+    if (del.error) {
+      return NextResponse.json({ error: del.error.message }, { status: 400 });
+    }
+
+    const balanceUpdate = await applyBalanceDelta(
+      existingRes.data.bank_account_id as string,
+      -goalMovementAccountImpact(existingGoalMove.moveType, amount)
+    );
+    if (!balanceUpdate.ok) {
+      return NextResponse.json({ error: balanceUpdate.error }, { status: 400 });
+    }
+
+    const goalUpdate = await updateGoalRecord(existingGoalMove.goalId, { current_amount: nextGoalCurrent });
+    if (goalUpdate.error) {
+      return NextResponse.json({ error: goalUpdate.error }, { status: 400 });
+    }
+
+    return NextResponse.json({ success: true });
   }
 
   const existingType = normalizeType(existingRes.data.type);

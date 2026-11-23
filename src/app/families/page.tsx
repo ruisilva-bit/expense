@@ -8,7 +8,6 @@ import { AppNav } from "@/components/AppNav";
 import { EntityPopover } from "@/components/EntityPopover";
 import { useAppState } from "@/context/AppState";
 import { fetchClientJson, getClientAuthHeaders } from "@/lib/client-fetch";
-import { supabaseBrowser } from "@/lib/supabase-browser";
 
 type Family = { id: string; name: string; role?: string | null };
 type FamilyMember = {
@@ -17,14 +16,17 @@ type FamilyMember = {
   email?: string | null;
   name: string;
   role: "owner" | "member" | null;
+  kind?: "human" | "system" | null;
+  is_api_user?: boolean;
 };
 
 export default function FamiliesPage() {
   const router = useRouter();
-  const supabase = supabaseBrowser();
   const [isCreating, setIsCreating] = useState(false);
   const [isAddingMember, setIsAddingMember] = useState(false);
   const [newMemberRole, setNewMemberRole] = useState<"owner" | "member">("member");
+  const [newMemberKind, setNewMemberKind] = useState<"human" | "system">("human");
+  const [newSystemPassword, setNewSystemPassword] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [memberError, setMemberError] = useState<string | null>(null);
   const [activeFamilyId, setActiveFamilyId] = useState<string | null>(null);
@@ -36,6 +38,8 @@ export default function FamiliesPage() {
   const [editingMemberName, setEditingMemberName] = useState("");
   const [editingMemberEmail, setEditingMemberEmail] = useState("");
   const [editingMemberRole, setEditingMemberRole] = useState<"owner" | "member">("member");
+  const [editingMemberKind, setEditingMemberKind] = useState<"human" | "system">("human");
+  const [editingMemberPassword, setEditingMemberPassword] = useState("");
   const [deletingMember, setDeletingMember] = useState<FamilyMember | null>(null);
   const {
     user,
@@ -86,15 +90,12 @@ export default function FamiliesPage() {
     setIsCreating(true);
 
     try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      const token = session?.access_token;
+      const headers = await getClientAuthHeaders();
       const response = await fetch("/api/families", {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...headers,
         },
         body: JSON.stringify({ name }),
       });
@@ -187,12 +188,21 @@ export default function FamiliesPage() {
           "content-type": "application/json",
           ...headers,
         },
-        body: JSON.stringify({ familyId: activeFamily.id, name, email, role }),
+        body: JSON.stringify({
+          familyId: activeFamily.id,
+          name,
+          email,
+          role,
+          kind: newMemberKind,
+          password: newMemberKind === "system" ? String(formData.get("password") || "").trim() : undefined,
+        }),
       });
       setMembersVersion((value) => value + 1);
       refreshFamilies();
       void mutateMembers();
       setNewMemberRole("member");
+      setNewMemberKind("human");
+      setNewSystemPassword("");
     } catch (error) {
       setMemberError(error instanceof Error ? error.message : "Could not add member.");
     } finally {
@@ -204,7 +214,9 @@ export default function FamiliesPage() {
     memberId: string,
     nextName: string,
     nextEmail: string,
-    nextRole: "owner" | "member"
+    nextRole: "owner" | "member",
+    nextKind: "human" | "system",
+    nextPassword?: string
   ) => {
     if (!activeFamily || activeFamily.role !== "owner") return;
     if (!nextName.trim()) return;
@@ -221,6 +233,7 @@ export default function FamiliesPage() {
           name: nextName.trim(),
           email: nextEmail.trim() || null,
           role: nextRole,
+          password: nextKind === "system" ? nextPassword?.trim() || null : null,
         }),
       });
       void mutateMembers();
@@ -250,22 +263,25 @@ export default function FamiliesPage() {
   };
 
   const isLoading = isAuthLoading || isFamiliesLoading;
+  const isApiUser = (member: FamilyMember) => member.is_api_user === true || member.kind === "system";
+  const humanMembers = (membersData ?? []).filter((member) => !isApiUser(member));
+  const apiUsers = (membersData ?? []).filter((member) => isApiUser(member));
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen app-shell">
       <AppNav />
-      <main className="mx-auto max-w-5xl space-y-6 px-4 py-8 lg:pl-64">
-        <div className="flex items-center justify-between gap-4">
+      <main className="app-main page-families max-w-5xl space-y-8">
+        <div className="page-header">
           <div>
-            <p className="text-sm text-slate-500">Family</p>
-            <h1 className="text-2xl font-semibold">Manage households</h1>
-            <p className="text-sm text-slate-500">
+            <p className="page-kicker">Family</p>
+            <h1 className="page-title">The people behind the numbers</h1>
+            <p className="page-subtitle">
               {user?.email ? `Signed in as ${user.email}` : "Checking your session..."}
             </p>
           </div>
         </div>
 
-        <form action={handleCreateFamily} className="card space-y-3 p-4">
+        <form action={handleCreateFamily} className="card editorial-form space-y-3 p-4">
           <p className="text-sm text-slate-600">Create family</p>
           <input name="name" className="input" placeholder="Family name" required />
           {createError && <p className="text-sm text-red-600">{createError}</p>}
@@ -293,7 +309,7 @@ export default function FamiliesPage() {
         )}
 
         {!isLoading && (
-          <section className="space-y-3">
+          <section className="ledger-selector-list space-y-3">
             {families.map((family) => (
               <button
                 key={family.id}
@@ -367,61 +383,178 @@ export default function FamiliesPage() {
             <p className="text-xs text-slate-500">Only owners can edit or delete this family.</p>
           )}
 
-          <section className="space-y-2">
-            <h3 className="text-lg font-semibold">Members</h3>
+          <section className="space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-lg font-semibold">People & API users</h3>
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <span className="rounded-full bg-slate-100 px-2.5 py-1">{humanMembers.length} membros</span>
+                <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-emerald-800">{apiUsers.length} API</span>
+              </div>
+            </div>
             {membersError && <p className="text-sm text-red-600">Could not load members: {membersError.message}</p>}
             {memberError && <p className="text-sm text-red-600">{memberError}</p>}
             {isMembersLoading && <div className="card p-3 text-sm text-slate-500">Loading members...</div>}
             {!isMembersLoading && !(membersData ?? []).length && (
               <div className="card p-3 text-sm text-slate-500">No members yet.</div>
             )}
-            {!!(membersData ?? []).length && (
-              <ul className="card divide-y divide-slate-200 px-4">
-                {(membersData ?? []).map((member) => (
-                  <li key={member.id} className="flex items-center justify-between gap-3 py-3">
-                    <div>
-                      <p className="font-medium text-slate-900">{member.name}</p>
-                      <p className="text-xs text-slate-500">{member.role ?? "member"}</p>
-                      <p className="text-xs text-slate-500">
-                        {member.email ? member.email : member.user_id ? "Linked user" : "Fictitious member"}
-                      </p>
-                    </div>
-                    {activeFamily.role === "owner" && (
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          className="btn btn-ghost px-3 py-1.5 text-xs"
-                          onClick={() => {
-                            setEditingMember(member);
-                            setEditingMemberName(member.name);
-                            setEditingMemberEmail(member.email ?? "");
-                            setEditingMemberRole(member.role === "owner" ? "owner" : "member");
-                          }}
-                        >
-                          Edit
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-ghost px-3 py-1.5 text-xs text-red-600"
-                          onClick={() => {
-                            setDeletingMember(member);
-                          }}
-                        >
-                          Remove
-                        </button>
+
+            {!!humanMembers.length && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Members</h4>
+                  <p className="text-xs text-slate-400">Dashboard users e membros fictícios</p>
+                </div>
+                <ul className="card divide-y divide-slate-200 px-4">
+                  {humanMembers.map((member) => (
+                    <li key={member.id} className="flex items-center justify-between gap-3 py-3">
+                      <div>
+                        <p className="font-medium text-slate-900">{member.name}</p>
+                        <p className="text-xs text-slate-500">{member.role ?? "member"}</p>
+                        <p className="text-xs text-slate-500">
+                          {member.email ? member.email : member.user_id ? "Linked user" : "Fictitious member"}
+                        </p>
                       </div>
-                    )}
-                  </li>
-                ))}
-              </ul>
+                      {activeFamily.role === "owner" && (
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            className="btn btn-ghost px-3 py-1.5 text-xs"
+                            onClick={() => {
+                              setEditingMember(member);
+                              setEditingMemberName(member.name);
+                              setEditingMemberEmail(member.email ?? "");
+                              setEditingMemberRole(member.role === "owner" ? "owner" : "member");
+                              setEditingMemberKind(member.kind === "system" ? "system" : "human");
+                              setEditingMemberPassword("");
+                            }}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-ghost px-3 py-1.5 text-xs text-red-600"
+                            onClick={() => {
+                              setDeletingMember(member);
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-semibold uppercase tracking-wide text-slate-500">API users</h4>
+                <p className="text-xs text-slate-400">Acesso programático / integrações</p>
+              </div>
+              {!apiUsers.length ? (
+                <div className="rounded-xl border border-dashed border-emerald-200 bg-emerald-50/60 p-4 text-sm text-emerald-900">
+                  Ainda não tens utilizadores de API nesta família.
+                </div>
+              ) : (
+                <ul className="card divide-y divide-slate-200 px-4">
+                  {apiUsers.map((member) => (
+                    <li key={member.id} className="flex items-center justify-between gap-3 py-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <p className="font-medium text-slate-900">{member.name}</p>
+                          <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">API</span>
+                        </div>
+                        <p className="text-xs text-slate-500">{member.role ?? "member"}</p>
+                        <p className="text-xs text-slate-500">{member.email ?? "Sem email"}</p>
+                      </div>
+                      {activeFamily.role === "owner" && (
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            className="btn btn-ghost px-3 py-1.5 text-xs"
+                            onClick={() => {
+                              setEditingMember(member);
+                              setEditingMemberName(member.name);
+                              setEditingMemberEmail(member.email ?? "");
+                              setEditingMemberRole(member.role === "owner" ? "owner" : "member");
+                              setEditingMemberKind("system");
+                              setEditingMemberPassword("");
+                            }}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-ghost px-3 py-1.5 text-xs text-red-600"
+                            onClick={() => {
+                              setDeletingMember(member);
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </section>
 
           {activeFamily.role === "owner" && (
-            <form action={addMember} className="space-y-2 rounded-xl border border-slate-200 p-3">
-              <p className="text-sm font-medium text-slate-700">Add member</p>
-              <input name="name" className="input" placeholder="Member name" required />
-              <input name="email" type="email" className="input" placeholder="Email (optional for real users)" />
+            <form action={addMember} className="space-y-3 rounded-xl border border-slate-200 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-slate-700">Add member</p>
+                  <p className="text-xs text-slate-500">
+                    Cria um membro humano para o dashboard ou um utilizador técnico para integrações via API.
+                  </p>
+                </div>
+                <div className="flex rounded-full bg-slate-100 p-1 text-xs font-medium">
+                  <button
+                    type="button"
+                    className={`rounded-full px-3 py-1 transition ${newMemberKind === "human" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+                    onClick={() => setNewMemberKind("human")}
+                  >
+                    Humano
+                  </button>
+                  <button
+                    type="button"
+                    className={`rounded-full px-3 py-1 transition ${newMemberKind === "system" ? "bg-emerald-700 text-white shadow-sm" : "text-slate-500"}`}
+                    onClick={() => setNewMemberKind("system")}
+                  >
+                    API
+                  </button>
+                </div>
+              </div>
+
+              {newMemberKind === "system" && (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-900">
+                  Este utilizador serve para chamadas API e integrações. Não aparece como pessoa normal no dashboard nem pode ser atribuído a despesas/receitas.
+                </div>
+              )}
+
+              <input name="name" className="input" placeholder={newMemberKind === "system" ? "Nome do utilizador API" : "Nome do membro"} required />
+              <input
+                name="email"
+                type="email"
+                className="input"
+                placeholder={newMemberKind === "system" ? "api-user@email.com" : "Email (opcional para utilizadores reais)"}
+                required={newMemberKind === "system"}
+              />
+              {newMemberKind === "system" && (
+                <input
+                  name="password"
+                  type="password"
+                  className="input"
+                  placeholder="Password para autenticação API"
+                  minLength={8}
+                  required
+                  value={newSystemPassword}
+                  onChange={(event) => setNewSystemPassword(event.target.value)}
+                />
+              )}
               <label className="space-y-1">
                 <span className="text-xs font-medium text-slate-600">Role</span>
                 <select
@@ -435,7 +568,7 @@ export default function FamiliesPage() {
                 </select>
               </label>
               <button className="btn btn-primary w-full" type="submit" disabled={isAddingMember}>
-                {isAddingMember ? "Saving..." : "Add member"}
+                {isAddingMember ? "Saving..." : newMemberKind === "system" ? "Criar utilizador API" : "Add member"}
               </button>
             </form>
           )}
@@ -504,7 +637,7 @@ export default function FamiliesPage() {
         open={Boolean(editingMember)}
         onClose={() => setEditingMember(null)}
         title="Edit member"
-        subtitle="Family member"
+        subtitle={editingMemberKind === "system" ? "API system user" : "Family member"}
       >
         <form
           className="space-y-3"
@@ -512,7 +645,7 @@ export default function FamiliesPage() {
             event.preventDefault();
             if (!editingMember) return;
             void (async () => {
-              await updateMember(editingMember.id, editingMemberName, editingMemberEmail, editingMemberRole);
+              await updateMember(editingMember.id, editingMemberName, editingMemberEmail, editingMemberRole, editingMemberKind, editingMemberPassword);
               setEditingMember(null);
             })();
           }}
@@ -527,14 +660,27 @@ export default function FamiliesPage() {
               required
             />
           </label>
+          {editingMemberKind === "system" && (
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Rotate password (optional)</span>
+              <input
+                className="input"
+                type="password"
+                minLength={8}
+                value={editingMemberPassword}
+                onChange={(event) => setEditingMemberPassword(event.target.value)}
+                placeholder="Leave blank to keep current password"
+              />
+            </label>
+          )}
           <label className="space-y-1">
-            <span className="text-xs font-medium text-slate-600">Email (optional)</span>
+            <span className="text-xs font-medium text-slate-600">{editingMemberKind === "system" ? "System login email" : "Email (optional)"}</span>
             <input
               className="input"
               type="email"
               value={editingMemberEmail}
               onChange={(event) => setEditingMemberEmail(event.target.value)}
-              placeholder="member@email.com"
+              placeholder={editingMemberKind === "system" ? "api-user@email.com" : "member@email.com"}
             />
           </label>
           <label className="space-y-1">

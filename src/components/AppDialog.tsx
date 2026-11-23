@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { createPortal } from "react-dom";
 import { lockBodyScroll } from "@/lib/body-scroll-lock";
 
 type AppDialogProps = {
@@ -36,11 +37,11 @@ export function AppDialog({
     };
   }, [open, onClose]);
 
-  if (!open) return null;
+  if (!open || typeof document === "undefined") return null;
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-900/45 p-0 sm:items-center sm:p-4"
+      className="dialog-scrim fixed inset-0 z-[70] flex items-end justify-center p-0 sm:items-center sm:p-4"
       role="dialog"
       aria-modal="true"
       onMouseDown={(event) => {
@@ -48,20 +49,21 @@ export function AppDialog({
       }}
     >
       <section
-        className={`w-full rounded-t-3xl border border-slate-200 bg-white shadow-xl sm:rounded-2xl ${maxWidthClassName}`}
+        className={`dialog-panel w-full ${maxWidthClassName}`}
       >
-        <header className="flex items-start justify-between border-b border-slate-200 px-4 py-3 sm:px-5">
+        <header className="dialog-header flex items-start justify-between border-b px-4 py-3 sm:px-5">
           <div>
             {subtitle && <p className="text-xs font-medium uppercase tracking-wide text-slate-500">{subtitle}</p>}
-            <h3 className="text-lg font-semibold text-slate-900">{title}</h3>
+            <h3 className="text-xl">{title}</h3>
           </div>
           <button type="button" className="btn btn-ghost px-3 py-1.5 text-sm" onClick={onClose}>
             Close
           </button>
         </header>
-        <div className="max-h-[78vh] space-y-4 overflow-y-auto p-4 sm:p-5">{children}</div>
+        <div className="dialog-body max-h-[78vh] space-y-4 overflow-y-auto p-4 sm:p-5">{children}</div>
       </section>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -95,7 +97,7 @@ export function ConfirmDialog({
         </button>
         <button
           type="button"
-          className={`btn ${destructive ? "bg-red-600 text-white hover:bg-red-700" : "btn-primary"}`}
+          className={`btn ${destructive ? "btn-danger" : "btn-primary"}`}
           onClick={onConfirm}
         >
           {confirmLabel}

@@ -12,6 +12,7 @@ import { fetchClientJson, getClientAuthHeaders } from "@/lib/client-fetch";
 import { formatEur } from "@/lib/format";
 
 type TxnType = "income" | "expense" | "transfer";
+type FlowFilter = "all" | "in" | "out";
 type Member = { id: string; name: string };
 type Account = { id: string; name: string; is_shared?: boolean; member_ids?: string[] };
 type Category = { id: string; name: string; type: TxnType; affects_loan?: boolean; color?: string | null };
@@ -31,6 +32,8 @@ type Transaction = {
   bank_account?: { id: string; name: string } | null;
   category?: { id: string; name: string; type: string; affects_loan?: boolean; color?: string | null } | null;
   loan?: { id: string; name: string } | null;
+  balance_after?: number | null;
+  goal_move_type?: "allocate" | "release" | "spend" | null;
 };
 
 type TransactionsPayload = {
@@ -85,8 +88,28 @@ const buildQuery = ({
   return params.toString();
 };
 
+const inferActivityFlow = (transaction: Transaction): FlowFilter | null => {
+  if (transaction.type === "income") return "in";
+  if (transaction.type === "expense") return "out";
+  if (transaction.goal_move_type === "release") return "in";
+  if (transaction.goal_move_type === "allocate" || transaction.goal_move_type === "spend") return "out";
+  if (transaction.transfer_side === "dest") return "in";
+  if (transaction.transfer_side === "source") return "out";
+  return null;
+};
+
 const exportTransactionsToXls = (transactions: Transaction[]) => {
-  const headers = ["Date", "Type", "Category", "Member", "Account", "Amount", "Description", "Loan"];
+  const headers = [
+    "Date",
+    "Type",
+    "Category",
+    "Member",
+    "Account",
+    "Amount",
+    "Balance after",
+    "Description",
+    "Loan",
+  ];
   const rows = transactions.map((transaction) => [
     transaction.date ?? "",
     transaction.type,
@@ -94,6 +117,7 @@ const exportTransactionsToXls = (transactions: Transaction[]) => {
     transaction.member?.name ?? "Unassigned",
     transaction.bank_account?.name ?? "",
     transaction.amount.toFixed(2),
+    transaction.balance_after == null ? "" : Number(transaction.balance_after).toFixed(2),
     transaction.description ?? "",
     transaction.loan?.name ?? "",
   ]);
@@ -134,6 +158,7 @@ export default function TransactionsPage() {
   const [filterAccountId, setFilterAccountId] = useState("");
   const [filterMemberId, setFilterMemberId] = useState("");
   const [filterCategoryId, setFilterCategoryId] = useState("");
+  const [flowFilter, setFlowFilter] = useState<FlowFilter>("all");
   const [filterDateFrom, setFilterDateFrom] = useState("");
   const [filterDateTo, setFilterDateTo] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
@@ -241,28 +266,36 @@ export default function TransactionsPage() {
     Boolean(selectedEditingAccount?.is_shared) && sharedEditingMemberIds.length > 1;
   const isEditingTransfer = editingTransaction?.type === "transfer";
   const isEditingExpense = editingTransaction?.type === "expense";
+  const visibleTransactions = useMemo(() => {
+    const transactions = data?.transactions ?? [];
+    if (flowFilter === "all") return transactions;
+    return transactions.filter((transaction) => inferActivityFlow(transaction) === flowFilter);
+  }, [data?.transactions, flowFilter]);
 
   useEffect(() => {
     if (!editingTransaction || isEditingTransfer) return;
     if (!editingMembersPool.length) return;
-    if (canApplyAllMembersOnEdit && editingApplyAllMembers) {
-      const nextIds = sharedEditingMemberIds;
-      const nextAssigned = sharedEditingMemberIds[0] ?? editingMembersPool[0].id;
-      if (!sameIds(editingMemberIds, nextIds)) setEditingMemberIds(nextIds);
-      if (editingAssignedTo !== nextAssigned) setEditingAssignedTo(nextAssigned);
-      return;
-    }
 
-    const validSelected = editingMemberIds.filter((memberId) =>
-      editingMembersPool.some((member) => member.id === memberId)
-    );
-    const fallback =
-      validSelected[0] ??
-      editingMembersPool.find((member) => member.id === editingAssignedTo)?.id ??
-      editingMembersPool[0].id;
-    const nextIds = validSelected.length ? validSelected : [fallback];
-    if (!sameIds(editingMemberIds, nextIds)) setEditingMemberIds(nextIds);
-    if (editingAssignedTo !== fallback) setEditingAssignedTo(fallback);
+    queueMicrotask(() => {
+      if (canApplyAllMembersOnEdit && editingApplyAllMembers) {
+        const nextIds = sharedEditingMemberIds;
+        const nextAssigned = sharedEditingMemberIds[0] ?? editingMembersPool[0].id;
+        if (!sameIds(editingMemberIds, nextIds)) setEditingMemberIds(nextIds);
+        if (editingAssignedTo !== nextAssigned) setEditingAssignedTo(nextAssigned);
+        return;
+      }
+
+      const validSelected = editingMemberIds.filter((memberId) =>
+        editingMembersPool.some((member) => member.id === memberId)
+      );
+      const fallback =
+        validSelected[0] ??
+        editingMembersPool.find((member) => member.id === editingAssignedTo)?.id ??
+        editingMembersPool[0].id;
+      const nextIds = validSelected.length ? validSelected : [fallback];
+      if (!sameIds(editingMemberIds, nextIds)) setEditingMemberIds(nextIds);
+      if (editingAssignedTo !== fallback) setEditingAssignedTo(fallback);
+    });
   }, [
     editingTransaction,
     isEditingTransfer,
@@ -326,24 +359,29 @@ export default function TransactionsPage() {
 
   if (!selectedFamily) {
     return (
-      <div className="min-h-screen">
+      <div className="min-h-screen app-shell">
         <AppNav />
-        <main className="p-6 lg:pl-64">Select a family first.</main>
+        <main className="app-main max-w-5xl">
+          <div className="empty-state">Select a family first.</div>
+        </main>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen app-shell">
       <AppNav />
-      <main className="mx-auto max-w-5xl px-4 py-8 space-y-6 lg:pl-64">
-        <div>
-          <p className="text-sm text-slate-500">Activity</p>
-          <h1 className="text-2xl font-semibold">{selectedFamily.name}</h1>
+      <main className="app-main page-transactions max-w-5xl space-y-8">
+        <div className="page-header">
+          <div>
+            <p className="page-kicker">Activity</p>
+            <h1 className="page-title">{selectedFamily.name}</h1>
+            <p className="page-subtitle">Review transactions, filter quickly, and export the current list.</p>
+          </div>
         </div>
 
         {(error || actionError) && (
-          <div className="card p-3 text-sm text-red-700 bg-red-50 border-red-200">
+          <div className="status-banner status-banner-error">
             {error ? `Could not load transactions: ${error.message}` : actionError}
           </div>
         )}
@@ -358,8 +396,8 @@ export default function TransactionsPage() {
               <button
                 type="button"
                 className="btn btn-primary"
-                onClick={() => exportTransactionsToXls(data?.transactions ?? [])}
-                disabled={!data?.transactions?.length}
+                onClick={() => exportTransactionsToXls(visibleTransactions)}
+                disabled={!visibleTransactions.length}
               >
                 Export .xls
               </button>
@@ -367,6 +405,28 @@ export default function TransactionsPage() {
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="sm:col-span-2 lg:col-span-3 flex flex-wrap items-center gap-2">
+              <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Flow</span>
+              {[
+                { id: "all", label: "All" },
+                { id: "in", label: "In" },
+                { id: "out", label: "Out" },
+              ].map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={`chip-toggle ${
+                    flowFilter === option.id
+                      ? "bg-sky-700 text-white border-sky-700"
+                      : ""
+                  }`}
+                  data-active={flowFilter === option.id}
+                  onClick={() => setFlowFilter(option.id as FlowFilter)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
             <PrettySelect
               value={filterAccountId}
               onChange={setFilterAccountId}
@@ -385,8 +445,14 @@ export default function TransactionsPage() {
               options={categoryOptions}
               placeholder="All categories"
             />
-            <input className="input" type="date" value={filterDateFrom} onChange={(event) => setFilterDateFrom(event.target.value)} />
-            <input className="input" type="date" value={filterDateTo} onChange={(event) => setFilterDateTo(event.target.value)} />
+            <label className="space-y-1">
+              <span className="label !mb-0">From</span>
+              <input className="input" type="date" value={filterDateFrom} onChange={(event) => setFilterDateFrom(event.target.value)} />
+            </label>
+            <label className="space-y-1">
+              <span className="label !mb-0">To</span>
+              <input className="input" type="date" value={filterDateTo} onChange={(event) => setFilterDateTo(event.target.value)} />
+            </label>
             <button
               type="button"
               className="btn btn-ghost"
@@ -394,6 +460,7 @@ export default function TransactionsPage() {
                 setFilterAccountId("");
                 setFilterMemberId("");
                 setFilterCategoryId("");
+                setFlowFilter("all");
                 setFilterDateFrom("");
                 setFilterDateTo("");
               }}
@@ -407,15 +474,16 @@ export default function TransactionsPage() {
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold">Recent activity</h2>
           </div>
-          {isLoading && <p className="text-sm text-slate-500">Loading transactions...</p>}
-          {!isLoading && !(data?.transactions ?? []).length && (
-            <p className="text-sm text-slate-500">No transactions yet.</p>
+          {isLoading && <p className="loading-state">Loading transactions...</p>}
+          {!isLoading && !visibleTransactions.length && (
+            <p className="empty-state">No transactions for the selected filters.</p>
           )}
           <ul className="divide-y divide-slate-200">
-            {(data?.transactions ?? []).map((transaction) => {
+            {visibleTransactions.map((transaction) => {
               const categoryName =
                 transaction.category?.name ?? (transaction.type === "transfer" ? "Transfer" : "Uncategorized");
               const categoryColor = resolveCategoryColor(transaction.category?.color, categoryName);
+              const activityFlow = inferActivityFlow(transaction);
               return (
                 <li key={transaction.id} className="py-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
@@ -434,19 +502,18 @@ export default function TransactionsPage() {
                   <div className="space-y-2 sm:text-right">
                     <p
                       className={`font-semibold ${
-                        transaction.type === "income"
+                        activityFlow === "in"
                           ? "text-emerald-700"
-                          : transaction.type === "expense"
+                          : activityFlow === "out"
                             ? "text-red-600"
                             : "text-slate-700"
                       }`}
                     >
-                      {transaction.type === "income"
-                        ? "+"
-                        : transaction.type === "expense"
-                          ? "-"
-                          : "↔ "}
+                      {activityFlow === "in" ? "+" : activityFlow === "out" ? "-" : "↔ "}
                       {formatEur(transaction.amount)}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      Saldo ap&oacute;s: {transaction.balance_after == null ? "-" : formatEur(transaction.balance_after)}
                     </p>
                     <div className="flex gap-2">
                       <button

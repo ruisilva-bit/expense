@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import {
   asNumber,
   ensureAccountAccess,
@@ -28,6 +29,7 @@ type RecurringRow = {
   next_execution_date: string | null;
   description: string | null;
   created_at: string | null;
+  created_by: string | null;
 };
 type FamilyMemberRow = { id: string; name: string | null; user_id?: string | null };
 type CategoryRow = { id: string; name: string | null; color?: string | null };
@@ -45,6 +47,27 @@ const isMissingColorColumnError = (message: string) => {
 const GOAL_TAG_REGEX = /\[goal:([0-9a-fA-F-]{36})\]/;
 const LOAN_TAG_REGEX = /\[loan:([0-9a-fA-F-]{36})\]/;
 const RECURRING_TAG_REGEX = /\s*\[recurring:([0-9a-fA-F-]{36}):(\d{4}-\d{2}-\d{2})\]\s*$/;
+const RECURRING_MARKER_REGEX = /\[recurring:([0-9a-fA-F-]{36}):(\d{4}-\d{2}-\d{2})\]/;
+
+const isDuplicateKeyError = (message: string | undefined) => {
+  const lower = (message ?? "").toLowerCase();
+  return lower.includes("duplicate key") || lower.includes("unique constraint");
+};
+
+const deterministicRecurringTransactionId = (recurringId: string, occurrenceDate: string, bankAccountId: string) => {
+  const base = createHash("sha256")
+    .update(`${recurringId}:${occurrenceDate}:${bankAccountId}`)
+    .digest("hex")
+    .slice(0, 32)
+    .split("");
+
+  base[12] = "5";
+  const variantNibble = Number.parseInt(base[16] ?? "0", 16);
+  base[16] = ((variantNibble & 0x3) | 0x8).toString(16);
+
+  const hex = base.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+};
 
 const normalizeFrequency = (value: string | null | undefined) => {
   const raw = (value ?? "").trim().toLowerCase();
@@ -186,7 +209,13 @@ async function materializeRecurringBackfill(input: {
     }
 
     if (!existingTxn.data) {
+      const deterministicId = deterministicRecurringTransactionId(
+        input.recurringId,
+        occurrenceDate,
+        input.bankAccountId
+      );
       const insert = await admin.from("transactions").insert({
+        id: deterministicId,
         family_id: input.familyId,
         bank_account_id: input.bankAccountId,
         account_id: input.bankAccountId,
@@ -202,6 +231,10 @@ async function materializeRecurringBackfill(input: {
       });
 
       if (insert.error) {
+        if (isDuplicateKeyError(insert.error.message)) {
+          occurrenceDate = nextDateFromFrequency(occurrenceDate, input.frequency);
+          continue;
+        }
         return { nextExecutionDate: occurrenceDate, insertedCount, error: insert.error.message };
       }
 
@@ -254,6 +287,215 @@ async function materializeRecurringBackfill(input: {
   return { nextExecutionDate: occurrenceDate, insertedCount, error: null };
 }
 
+type RecurringTaggedTxnRow = {
+  id: string;
+  bank_account_id: string;
+  amount: number | string | null;
+  type: string | null;
+  category_id: string | null;
+  description: string | null;
+  created_at: string | null;
+};
+
+async function cleanupRecurringDuplicates(familyId: string, accountIds: string[]) {
+  if (!accountIds.length) {
+    return { removedCount: 0, fixedGroups: 0, errors: [] as string[] };
+  }
+
+  const admin = supabaseAdmin();
+  const taggedTxRes = await admin
+    .from("transactions")
+    .select("id,bank_account_id,amount,type,category_id,description,created_at")
+    .eq("family_id", familyId)
+    .in("bank_account_id", accountIds)
+    .ilike("description", "%[recurring:%");
+
+  if (taggedTxRes.error) {
+    return { removedCount: 0, fixedGroups: 0, errors: [taggedTxRes.error.message] };
+  }
+
+  const categoriesRes = await admin
+    .from("categories")
+    .select("id,affects_loan")
+    .eq("family_id", familyId);
+  const categoryAffectsLoan = new Map<string, boolean>(
+    (categoriesRes.data ?? []).map((row) => [row.id as string, Boolean(row.affects_loan)])
+  );
+
+  const grouped = new Map<string, RecurringTaggedTxnRow[]>();
+  ((taggedTxRes.data ?? []) as RecurringTaggedTxnRow[]).forEach((row) => {
+    const marker = row.description?.match(RECURRING_MARKER_REGEX)?.[0];
+    if (!marker) return;
+    const key = `${row.bank_account_id}:${marker}`;
+    const list = grouped.get(key) ?? [];
+    list.push(row);
+    grouped.set(key, list);
+  });
+
+  const idsToDelete: string[] = [];
+  let fixedGroups = 0;
+
+  grouped.forEach((rows) => {
+    if (rows.length <= 1) return;
+    fixedGroups += 1;
+    rows.sort((a, b) => {
+      const byDate = (a.created_at ?? "").localeCompare(b.created_at ?? "");
+      if (byDate !== 0) return byDate;
+      return a.id.localeCompare(b.id);
+    });
+
+    rows.slice(1).forEach((row) => {
+      idsToDelete.push(row.id);
+    });
+  });
+
+  if (!idsToDelete.length) {
+    return { removedCount: 0, fixedGroups: 0, errors: [] as string[] };
+  }
+
+  const errors: string[] = [];
+  const deletedRows: RecurringTaggedTxnRow[] = [];
+  for (let index = 0; index < idsToDelete.length; index += 200) {
+    const chunk = idsToDelete.slice(index, index + 200);
+    const deletion = await admin
+      .from("transactions")
+      .delete()
+      .in("id", chunk)
+      .select("id,bank_account_id,amount,type,category_id,description,created_at");
+    if (deletion.error) {
+      errors.push(deletion.error.message);
+      continue;
+    }
+    deletedRows.push(...((deletion.data ?? []) as RecurringTaggedTxnRow[]));
+  }
+
+  const bankDeltas = new Map<string, number>();
+  const goalDeltas = new Map<string, number>();
+  const loanDeltas = new Map<string, number>();
+  deletedRows.forEach((row) => {
+    const amount = asNumber(row.amount);
+    const type = (row.type ?? "").toLowerCase();
+    const currentBankDelta = bankDeltas.get(row.bank_account_id) ?? 0;
+    if (type === "income") bankDeltas.set(row.bank_account_id, currentBankDelta - amount);
+    if (type === "expense") bankDeltas.set(row.bank_account_id, currentBankDelta + amount);
+
+    const goalMatch = (row.description ?? "").match(GOAL_TAG_REGEX);
+    const goalId = goalMatch?.[1] ?? null;
+    if (goalId && amount > 0) {
+      goalDeltas.set(goalId, (goalDeltas.get(goalId) ?? 0) - amount);
+    }
+
+    const loanMatch = (row.description ?? "").match(LOAN_TAG_REGEX);
+    const loanId = loanMatch?.[1] ?? null;
+    const affectsLoan = row.category_id ? Boolean(categoryAffectsLoan.get(row.category_id)) : false;
+    if (loanId && affectsLoan && type === "expense" && amount > 0) {
+      loanDeltas.set(loanId, (loanDeltas.get(loanId) ?? 0) + amount);
+    }
+  });
+
+  for (const [accountId, delta] of bankDeltas.entries()) {
+    if (!delta) continue;
+    const account = await getAccount(accountId);
+    if (account.error || !account.data) {
+      errors.push(account.error ?? `Could not load account ${accountId} while fixing duplicates.`);
+      continue;
+    }
+    const nextBalance = asNumber(account.data.balance) + delta;
+    const update = await admin.from("bank_accounts").update({ balance: nextBalance }).eq("id", accountId);
+    if (update.error) errors.push(update.error.message);
+  }
+
+  for (const [goalId, delta] of goalDeltas.entries()) {
+    if (!delta) continue;
+    const goal = await admin.from("goals").select("id,current_amount").eq("id", goalId).maybeSingle();
+    if (goal.error || !goal.data) {
+      errors.push(goal.error?.message ?? `Could not load goal ${goalId} while fixing duplicates.`);
+      continue;
+    }
+    const nextAmount = Math.max(0, asNumber(goal.data.current_amount) + delta);
+    const update = await admin.from("goals").update({ current_amount: nextAmount }).eq("id", goalId);
+    if (update.error) errors.push(update.error.message);
+  }
+
+  for (const [loanId, delta] of loanDeltas.entries()) {
+    if (!delta) continue;
+    const loan = await admin
+      .from("loans")
+      .select("id,remaining_amount,total_amount")
+      .eq("id", loanId)
+      .maybeSingle();
+    if (loan.error || !loan.data) {
+      errors.push(loan.error?.message ?? `Could not load loan ${loanId} while fixing duplicates.`);
+      continue;
+    }
+    const currentRemaining = asNumber(loan.data.remaining_amount, asNumber(loan.data.total_amount));
+    const nextRemaining = Math.max(0, currentRemaining + delta);
+    const update = await admin.from("loans").update({ remaining_amount: nextRemaining }).eq("id", loanId);
+    if (update.error) errors.push(update.error.message);
+  }
+
+  return { removedCount: deletedRows.length, fixedGroups, errors };
+}
+
+async function reconcileRecurringRows(recurringRows: RecurringRow[], fallbackUserId: string) {
+  const admin = supabaseAdmin();
+  const today = todayIsoDate();
+  const rowsById = new Map<string, RecurringRow>(recurringRows.map((row) => [row.id, row]));
+
+  let insertedCount = 0;
+  let updatedSchedules = 0;
+  const errors: string[] = [];
+
+  for (const row of recurringRows) {
+    const normalized = normalizeRow(row);
+    if (normalized.next_execution_date > today) continue;
+
+    const backfill = await materializeRecurringBackfill({
+      recurringId: normalized.id,
+      familyId: normalized.family_id,
+      bankAccountId: normalized.bank_account_id,
+      assignedTo: normalized.assigned_to,
+      amount: normalized.amount,
+      categoryId: normalized.category_id,
+      frequency: normalized.frequency,
+      nextExecutionDate: normalized.next_execution_date,
+      description: normalized.description,
+      createdBy: row.created_by || fallbackUserId,
+    });
+
+    if (backfill.error) {
+      errors.push(`${row.id}: ${backfill.error}`);
+      continue;
+    }
+
+    insertedCount += backfill.insertedCount;
+
+    if (backfill.nextExecutionDate !== normalized.next_execution_date) {
+      const update = await admin
+        .from("recurring_transactions")
+        .update({ next_execution_date: backfill.nextExecutionDate })
+        .eq("id", row.id)
+        .select("*")
+        .single();
+
+      if (update.error || !update.data) {
+        errors.push(`${row.id}: ${update.error?.message ?? "Failed to update next execution date."}`);
+        continue;
+      }
+
+      rowsById.set(row.id, update.data as RecurringRow);
+      updatedSchedules += 1;
+    }
+  }
+
+  return {
+    rows: recurringRows.map((row) => rowsById.get(row.id) ?? row),
+    insertedCount,
+    updatedSchedules,
+    errors,
+  };
+}
+
 export async function GET(request: NextRequest) {
   const familyId = (request.nextUrl.searchParams.get("familyId") ?? "").trim();
   if (!familyId) {
@@ -291,6 +533,9 @@ export async function GET(request: NextRequest) {
   if (recurringRes.error) {
     return NextResponse.json({ error: recurringRes.error.message }, { status: 400 });
   }
+
+  const dedupe = await cleanupRecurringDuplicates(familyId, accessibleAccountIds);
+  const reconciliation = await reconcileRecurringRows((recurringRes.data ?? []) as RecurringRow[], user.id);
 
   let categoriesRes = (await admin
     .from("categories")
@@ -339,7 +584,7 @@ export async function GET(request: NextRequest) {
     };
   });
 
-  const recurring = ((recurringRes.data ?? []) as RecurringRow[]).map((row) => {
+  const recurring = (reconciliation.rows as RecurringRow[]).map((row) => {
     const normalized = normalizeRow(row);
     const memberIds = effectiveMemberIds(normalized.assigned_to, normalized.description);
     const memberNames = memberIds
@@ -368,6 +613,13 @@ export async function GET(request: NextRequest) {
       name: category.name ?? "Category",
       color: includeColor ? category.color ?? null : null,
     })),
+    reconciliation: {
+      inserted_occurrences: reconciliation.insertedCount,
+      updated_schedules: reconciliation.updatedSchedules,
+      removed_duplicates: dedupe.removedCount,
+      fixed_duplicate_groups: dedupe.fixedGroups,
+      errors: [...dedupe.errors, ...reconciliation.errors],
+    },
   });
 }
 
@@ -376,6 +628,7 @@ export async function POST(request: Request) {
   if (!user) return NextResponse.json({ error: userError ?? "Not signed in." }, { status: 401 });
 
   const payload = (await request.json().catch(() => ({}))) as {
+    action?: string;
     familyId?: string;
     bank_account_id?: string;
     assigned_to?: string | null;
@@ -388,6 +641,56 @@ export async function POST(request: Request) {
   };
 
   const familyId = (payload.familyId ?? "").trim();
+  const action = (payload.action ?? "").trim().toLowerCase();
+
+  if (action === "recalculate") {
+    if (!familyId) {
+      return NextResponse.json({ error: "familyId is required." }, { status: 400 });
+    }
+
+    const membership = await ensureFamilyMember(familyId, user.id);
+    if (!membership.ok) return NextResponse.json({ error: membership.error }, { status: membership.status });
+
+    const access = await getAccessibleAccountIds(familyId, user.id);
+    if (access.error || !access.accountIds) {
+      return NextResponse.json({ error: access.error ?? "Failed to load account access." }, { status: 400 });
+    }
+    if (!access.accountIds.length) {
+      return NextResponse.json({
+        success: true,
+        processed_recurring: 0,
+        inserted_occurrences: 0,
+        updated_schedules: 0,
+        errors: [],
+      });
+    }
+
+    const admin = supabaseAdmin();
+    const recurringRes = await admin
+      .from("recurring_transactions")
+      .select("*")
+      .eq("family_id", familyId)
+      .in("bank_account_id", access.accountIds)
+      .order("next_execution_date", { ascending: true });
+
+    if (recurringRes.error) {
+      return NextResponse.json({ error: recurringRes.error.message }, { status: 400 });
+    }
+
+    const dedupe = await cleanupRecurringDuplicates(familyId, access.accountIds);
+    const reconciliation = await reconcileRecurringRows((recurringRes.data ?? []) as RecurringRow[], user.id);
+
+    return NextResponse.json({
+      success: true,
+      processed_recurring: (recurringRes.data ?? []).length,
+      inserted_occurrences: reconciliation.insertedCount,
+      updated_schedules: reconciliation.updatedSchedules,
+      removed_duplicates: dedupe.removedCount,
+      fixed_duplicate_groups: dedupe.fixedGroups,
+      errors: [...dedupe.errors, ...reconciliation.errors],
+    });
+  }
+
   const bankAccountId = (payload.bank_account_id ?? "").trim();
   const assignedTo = (payload.assigned_to ?? "").trim();
   const memberIds = Array.from(

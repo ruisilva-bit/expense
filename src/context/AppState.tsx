@@ -35,6 +35,8 @@ const Context = createContext<AppState | undefined>(undefined);
 const SELECTED_FAMILY_KEY = "expense:selected-family";
 const SELECTED_ACCOUNT_KEY = "expense:selected-account";
 const MAIN_ACCOUNT_BY_FAMILY_KEY = "expense:main-account-by-family";
+const RECURRING_RECONCILE_PREFIX = "expense:recurring-reconcile";
+const RECURRING_RECONCILE_COOLDOWN_MS = 5 * 60 * 1000;
 
 const readMainAccountMap = (): Record<string, string> => {
   if (typeof window === "undefined") return {};
@@ -226,6 +228,47 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     // Keep legacy key synced to preserve compatibility with existing sessions.
     window.localStorage.setItem(SELECTED_ACCOUNT_KEY, selectedAccount.id);
   }, [selectedAccount?.id]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!activeFamilyId || !user?.id) return;
+
+    const key = `${RECURRING_RECONCILE_PREFIX}:${activeFamilyId}`;
+    const now = Date.now();
+    const previousRun = Number(window.localStorage.getItem(key) ?? "0");
+    if (Number.isFinite(previousRun) && now - previousRun < RECURRING_RECONCILE_COOLDOWN_MS) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const runReconciliation = async () => {
+      try {
+        const headers = await getAuthHeaders();
+        await fetch("/api/recurring-transactions", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...headers,
+          },
+          cache: "no-store",
+          credentials: "same-origin",
+          body: JSON.stringify({ familyId: activeFamilyId, action: "recalculate" }),
+        });
+        if (!cancelled) {
+          window.localStorage.setItem(key, String(Date.now()));
+        }
+      } catch {
+        // Silent on purpose: this is best-effort reconciliation.
+      }
+    };
+
+    void runReconciliation();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFamilyId, user?.id]);
 
   const refresh = () => {
     void mutateFamilies();
